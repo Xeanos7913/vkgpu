@@ -209,7 +209,8 @@ Notice how the set number for each buffer is 0, but the binding number is the in
 This library uses VkBootstrap (https://github.com/charles-lunarg/vk-bootstrap) and the vulkan sdk's includes.
 
 ## Future Plans:
-1. Support Tensors and other commonly used datatypes.
-2. Use Vulkan's powerful Buffer Device Address, or Buffer Reference for memory access in the shaders. This will eliminate the need for Descriptors and thereby potentially reduce CPU bottleneck.
-3. Expand the built-in memory manager to do some more fancy stuff, like paging and perhaps even sparse buffers.
+1. Send buffer's range along with the buffer to the shader for bounds checking.
+2. Support Tensors and other commonly used datatypes.
+3. Use Vulkan's powerful Buffer Device Address, or Buffer Reference for memory access in the shaders. This will eliminate the need for Descriptors and thereby potentially reduce CPU bottleneck.
+4. Expand the built-in memory manager to do some more fancy stuff, like paging and perhaps even sparse buffers.
     

@@ -35,6 +35,7 @@ int main(void) {
     
     std::cout << "\Single Result: \n\t";
     for (auto num : result) { std::cout << num << " "; }
+    return 0;
 }
 ```
 

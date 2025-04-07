@@ -15,9 +15,6 @@ int main(void) {
     // inputs for the single GPU task
     auto vec1 = std::vector<int>{ 1, 1, 1 };
     auto vec2 = std::vector<int>{ 5, 5, 5 };
-    auto vec3 = std::vector<int>{ 1, 1, 1 };
-    auto vec4 = std::vector<int>{ 1, 1, 1 };
-    auto vec5 = std::vector<int>{ 1, 1, 1 };
 
     auto input = std::vector<std::vector<int>>{ vec1, vec2};
 

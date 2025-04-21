@@ -8,6 +8,7 @@
 #include <iostream>
 #include <vector>
 
+
 struct Init {
     vkb::Instance instance;
     vkb::InstanceDispatchTable inst_disp;
@@ -15,7 +16,6 @@ struct Init {
     vkb::DispatchTable disp;
 };
 
-// get the memory index for a buffer
 uint32_t get_memory_index(Init& init, const uint32_t type_bits, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
     VkPhysicalDeviceMemoryProperties mem_props = init.device.physical_device.memory_properties;
     for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
@@ -26,96 +26,349 @@ uint32_t get_memory_index(Init& init, const uint32_t type_bits, VkMemoryProperty
     return UINT32_MAX; // No valid memory type found
 }
 
-// create a buffer on the GPU, or CPU, whichever flags is passed as argument
-// usingDescriptors is set to true by default, but if it's set to false, it's supposed to use Buffer Reference, but I haven't implemented that yet.
-void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
-    VkBuffer& buffer, VkDeviceMemory& bufferMemory, Init* init, bool usingDescriptors = true) {
+struct Allocator {
+    
+    Allocator(Init* init) : init(init) {
+        commandBuffers.resize(1);
+        get_queues();
+		create_command_pool();
+    };
 
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size;
-    bufferInfo.usage = usage;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    init->disp.createBuffer(&bufferInfo, nullptr, &buffer);
-
-    VkMemoryRequirements memRequirements;
-    init->disp.getBufferMemoryRequirements(buffer, &memRequirements);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = get_memory_index(*init, memRequirements.memoryTypeBits, properties);
-
-    if (init->disp.allocateMemory(&allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
-        throw std::runtime_error("could not allocate memory");
+    ~Allocator() {
+        if (!commandBuffers.empty()) {
+            init->disp.freeCommandBuffers(commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
+			commandBuffers.clear();
+        }
+		
+		init->disp.destroyCommandPool(commandPool, nullptr);
     }
-    if (init->disp.bindBufferMemory(buffer, bufferMemory, 0) != VK_SUCCESS) {
-        throw std::runtime_error("could not bind memory");
+
+    std::pair<VkBuffer, VkDeviceMemory> createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool usingDescriptors = true) {
+        VkBuffer buffer{};
+		VkDeviceMemory bufferMemory{};
+
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = size;
+        bufferInfo.usage = usage;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        init->disp.createBuffer(&bufferInfo, nullptr, &buffer);
+
+        VkMemoryRequirements memRequirements;
+        init->disp.getBufferMemoryRequirements(buffer, &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = get_memory_index(*init, memRequirements.memoryTypeBits, properties);
+
+        if (init->disp.allocateMemory(&allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("could not allocate memory");
+        }
+        if (init->disp.bindBufferMemory(buffer, bufferMemory, 0) != VK_SUCCESS) {
+            throw std::runtime_error("could not bind memory");
+        }
+        return { buffer, bufferMemory };
+    };
+
+	std::pair<VkImage, VkDeviceMemory> createImage(VkDeviceSize size, VkImageUsageFlags usage, VkImageType imageType, VkMemoryPropertyFlags properties, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM,VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, VkSharingMode sharingMode = VK_SHARING_MODE_EXCLUSIVE) {
+		VkImage image{};
+		VkDeviceMemory imageMemory{};
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = imageType;
+		imageInfo.extent.width = static_cast<uint32_t>(size);
+		imageInfo.extent.height = static_cast<uint32_t>(size);
+		imageInfo.extent.depth = 1;
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.format = format;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageInfo.usage = usage;
+		imageInfo.samples = samples;
+		imageInfo.sharingMode = sharingMode;
+		init->disp.createImage(&imageInfo, nullptr, &image);
+		VkMemoryRequirements memRequirements;
+		init->disp.getImageMemoryRequirements(image, &memRequirements);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memRequirements.size;
+		allocInfo.memoryTypeIndex = get_memory_index(*init, memRequirements.memoryTypeBits, properties);
+		if (init->disp.allocateMemory(&allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+			throw std::runtime_error("could not allocate memory");
+		}
+		if (init->disp.bindImageMemory(image, imageMemory, 0) != VK_SUCCESS) {
+			throw std::runtime_error("could not bind memory");
+		}
+		return { image, imageMemory };
+	}
+
+    void fillBuffer(VkBuffer buffer, VkDeviceMemory memory, uint32_t data, VkDeviceSize offset = 0, VkDeviceSize range = VK_WHOLE_SIZE) {
+		auto cmd = beginSingleTimeCommands();
+        vkCmdFillBuffer(commandBuffers[cmd], buffer, offset, range, data);
+		endSingleTimeCommands(true, false);
     }
-}
 
-// Very useful to have copy buffer functions
-VkCommandBuffer beginSingleTimeCommands(Init* init, VkCommandPool& commandPool) {
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = commandPool;
-    allocInfo.commandBufferCount = 1;
+	// avoid as much as possible, this kills performance. But if you need to free memory, this is the way to do it.
+    void freeMemory(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize range) {  
+        // Step 1: Create a staging buffer to temporarily hold the data
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingMemory;
+        VkDeviceSize bufferSize;
 
-    VkCommandBuffer commandBuffer;
-    init->disp.allocateCommandBuffers(&allocInfo, &commandBuffer);
+        // Get memory requirements for the buffer
+        VkMemoryRequirements memRequirements;
+        init->disp.getBufferMemoryRequirements(buffer, &memRequirements);
+        bufferSize = memRequirements.size;
 
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        // Create a staging buffer
+        auto stageBuff = createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        stagingBuffer = stageBuff.first;
+        stagingMemory = stageBuff.second;
 
-    init->disp.beginCommandBuffer(commandBuffer, &beginInfo);
-    return commandBuffer;
-}
+        // Step 2: Copy data before the gap to the staging buffer
+        if (offset > 0) {
+            sequentialCopyBuffer(buffer, stagingBuffer, offset, 0, 0);
+        }
 
-void endSingleTimeCommands(VkCommandBuffer commandBuffer, Init* init, VkCommandPool& commandPool, VkQueue& computeQueue) {
-    init->disp.endCommandBuffer(commandBuffer);
+        // Step 3: Copy data after the gap to the staging buffer
+        VkDeviceSize end = offset + range;
+        VkDeviceSize remainingSize = (end <= bufferSize) ? bufferSize - end : 0;
+        if (remainingSize > 0) {
+            sequentialCopyBuffer(buffer, stagingBuffer, remainingSize, offset + range, offset);
+        }
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
+        // Step 4: Copy the data back from the staging buffer to the original buffer
+        if (offset > 0) {
+            sequentialCopyBuffer(stagingBuffer, buffer, offset, 0, 0);
+        }
 
-    init->disp.queueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    init->disp.deviceWaitIdle();
+        if (remainingSize > 0) {  
+            sequentialCopyBuffer(stagingBuffer, buffer, remainingSize, offset, offset);
+        }
 
-    init->disp.freeCommandBuffers(commandPool, 1, &commandBuffer);
-}
+        submitAllCommands(true);
 
-void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset, Init* init, VkCommandPool& commandPool, VkQueue& computeQueue) {
-    VkCommandBuffer commandBuffer = beginSingleTimeCommands(init, commandPool);
+        // Step 5: Clear the staging buffer
+        init->disp.destroyBuffer(stagingBuffer, nullptr);
+        init->disp.freeMemory(stagingMemory, nullptr);
+    }
 
-    VkBufferCopy copyRegion{};
-    copyRegion.size = size;
-    copyRegion.dstOffset = dstOffset;
-    copyRegion.srcOffset = srcOffset;
-    vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
-    endSingleTimeCommands(commandBuffer, init, commandPool, computeQueue);
-}
+    void createMemoryBlob(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size) {
+		// Step 1: Create a staging buffer to temporarily hold the data
+		VkBuffer stagingBuffer;
+		VkDeviceMemory stagingMemory;
+		VkDeviceSize bufferSize;
+		// Get memory requirements for the buffer
+		VkMemoryRequirements memRequirements;
+		init->disp.getBufferMemoryRequirements(buffer, &memRequirements);
+		bufferSize = memRequirements.size;
+		// Create a staging buffer
+		auto stageBuff = createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		stagingBuffer = stageBuff.first;
+		stagingMemory = stageBuff.second;
+		// Step 2: Copy data before the gap to the staging buffer
+		if (offset > 0) {
+            sequentialCopyBuffer(buffer, stagingBuffer, offset, 0, 0);
+		}
+		// Step 3: Copy data after the gap to the staging buffer
+		VkDeviceSize remainingSize = bufferSize - (offset + size);
+		if (remainingSize > 0) {
+            sequentialCopyBuffer(buffer, stagingBuffer, remainingSize, offset + size, offset);
+		}
+		// Step 4: Copy the data back from the staging buffer to the original buffer
+		if (offset > 0) {
+            sequentialCopyBuffer(stagingBuffer, buffer, offset, 0, 0);
+		}
+		if (remainingSize > 0) {
+            sequentialCopyBuffer(stagingBuffer, buffer, remainingSize, offset, offset);
+		}
+
+        submitAllCommands(true);
+
+		// Step 5: Clear the staging buffer
+		init->disp.destroyBuffer(stagingBuffer, nullptr);
+		init->disp.freeMemory(stagingMemory, nullptr);
+	}
+
+    // this is cancer
+    void defragment(VkBuffer buffer, VkDeviceMemory memory) {
+		// not gonna implement this. This is a nightmare.
+    }
+
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset, bool async = false) {
+        auto cmd = beginSingleTimeCommands();
+        VkBufferCopy copyRegion{};
+        copyRegion.size = size;
+        copyRegion.dstOffset = dstOffset;
+        copyRegion.srcOffset = srcOffset;
+        vkCmdCopyBuffer(commandBuffers.back(), srcBuffer, dstBuffer, 1, &copyRegion);
+        endSingleTimeCommands(async);
+    }
+
+	void sequentialCopyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
+        auto cmd = beginSingleTimeCommands();
+		VkBufferCopy copyRegion{};
+		copyRegion.size = size;
+		copyRegion.dstOffset = dstOffset;
+		copyRegion.srcOffset = srcOffset;
+		vkCmdCopyBuffer(commandBuffers.back(), srcBuffer, dstBuffer, 1, &copyRegion);
+        endSingleTimeCommands(true, false);
+	}
+
+    // only supports sqare images
+	void copyImage(VkImage srcImage, VkImage dstImage, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
+		auto cmd = beginSingleTimeCommands();
+		VkImageCopy copyRegion{};
+		copyRegion.extent.width = static_cast<uint32_t>(size);
+		copyRegion.extent.height = static_cast<uint32_t>(size);
+		copyRegion.extent.depth = 1;
+		copyRegion.dstOffset.x = static_cast<int32_t>(dstOffset);
+		copyRegion.dstOffset.y = static_cast<int32_t>(dstOffset);
+		copyRegion.srcOffset.x = static_cast<int32_t>(srcOffset);
+		copyRegion.srcOffset.y = static_cast<int32_t>(srcOffset);
+		vkCmdCopyImage(commandBuffers[cmd], srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+		endSingleTimeCommands();
+	}
+
+private:
+    Init* init;
+    VkQueue allocQueue;
+    VkCommandPool commandPool;
+    std::vector<VkCommandBuffer> commandBuffers;
+    
+    int beginSingleTimeCommands() {
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandPool = commandPool;
+        allocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer commandBuffer;
+        init->disp.allocateCommandBuffers(&allocInfo, &commandBuffer);
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        init->disp.beginCommandBuffer(commandBuffer, &beginInfo);
+        commandBuffers.push_back(commandBuffer);
+		return commandBuffers.size() - 1; // return the index at which we just pushed the command buffer
+    }
+
+    void endSingleTimeCommands(bool async = false, bool dispatch = true) {
+        if (commandBuffers.empty()) return;
+
+        auto cmd = commandBuffers.back();
+        init->disp.endCommandBuffer(cmd);
+
+        if (dispatch) {
+            VkSubmitInfo submitInfo{};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            init->disp.queueSubmit(allocQueue, 1, &submitInfo, VK_NULL_HANDLE);
+            if (!async) {
+                init->disp.deviceWaitIdle();
+            }
+            else {
+                init->disp.queueWaitIdle(allocQueue);
+            }
+            init->disp.freeCommandBuffers(commandPool, 1, &cmd);
+            commandBuffers.pop_back();
+        }
+    }
+
+    void submitAllCommands(bool async = false) {
+        if (commandBuffers.empty()) return;
+		//commandBuffers.erase(commandBuffers.begin()); // the first command buffer is apparently invalid?! will have to fix later, right now, I'm exhausted.
+        VkSubmitInfo submitInfo{};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = commandBuffers.size();
+            submitInfo.pCommandBuffers = commandBuffers.data();
+            init->disp.queueSubmit(allocQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        if (async) { init->disp.queueWaitIdle(allocQueue); }    // this stalls the transfer queue, but not the whole device.
+		else { init->disp.deviceWaitIdle(); } 		// this stalls the whole device. This is terrible. But it's useful for stuff where you need to wait for the GPU to finish before you can do anything else.
+		
+        init->disp.freeCommandBuffers(commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
+        commandBuffers.clear();
+    }
+
+    int get_queues() {
+        auto gq = init->device.get_queue(vkb::QueueType::transfer);
+        if (!gq.has_value()) {
+            std::cout << "failed to get queue: " << gq.error().message() << "\n";
+            return -1;
+        }
+        allocQueue = gq.value();
+        return 0;
+    }
+
+    void create_command_pool() {
+        VkCommandPoolCreateInfo pool_info = {};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.queueFamilyIndex = init->device.get_queue_index(vkb::QueueType::transfer).value();
+        init->disp.createCommandPool(&pool_info, nullptr, &commandPool);
+
+        VkCommandBufferAllocateInfo allocate_info = {};
+        allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocate_info.commandPool = commandPool;
+        allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate_info.commandBufferCount = commandBuffers.size();
+        //init->disp.allocateCommandBuffers(&allocate_info, commandBuffers.data());
+    }
+};
 
 // lone wolf buffer. Has its own VkDeviceMemory. Uses a staging buffer to copy memory from host to GPU high-performance memory
 template<typename T>
 struct StandaloneBuffer {
     VkBuffer buffer{};
     VkDeviceMemory bufferMemory{};
+
+    VkBuffer stagingBuffer{};
+	VkDeviceMemory stagingBufferMemory{}; // Staging memory on CPU (same size as buffer and memory on GPU)
+
+    VkDeviceSize alignment;
+    VkDeviceSize capacity;
+
+    // stuff you need to send to pipeline creation:
     VkDescriptorSetLayoutBinding binding{};
     VkWriteDescriptorSet wrt_desc_set{};
     VkDescriptorBufferInfo desc_buf_info{};
     uint32_t bindingIndex;
     Init* init;
 
-    VkQueue computeQueue;
-    VkCommandPool commandPool;
+	// for copying buffers to GPU
+	std::shared_ptr<Allocator> allocator;
 
     void* memMap;
 
-    StandaloneBuffer(Init* init) : init(init), computeQueue(VK_NULL_HANDLE), commandPool(VK_NULL_HANDLE) {}
-    StandaloneBuffer() : init(nullptr), computeQueue(VK_NULL_HANDLE), commandPool(VK_NULL_HANDLE) {}
+    StandaloneBuffer(Init* init, uint32_t numElements, std::shared_ptr<Allocator>& allocator) : init(init), allocator(allocator) {
+
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(init->device.physical_device, &props);
+        alignment = props.limits.minStorageBufferOffsetAlignment;
+
+        capacity = numElements * sizeof(T);
+        capacity = (capacity + alignment - 1) & ~(alignment - 1);
+
+        // Create the staging buffer
+		auto stageBuff = allocator->createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+		stagingBuffer = stageBuff.first;
+		stagingBufferMemory = stageBuff.second;
+		
+        // Create the buffer
+        auto buff = allocator->createBuffer(capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+		buffer = buff.first;
+		bufferMemory = buff.second;
+        init->disp.mapMemory(stagingBufferMemory, 0, capacity, 0, &memMap);
+    }
+    StandaloneBuffer() : init(nullptr) { std::cout << "Called def constructor\n"; }
 
     void createDescriptors() {
         binding.binding = bindingIndex;
@@ -140,61 +393,26 @@ struct StandaloneBuffer {
     }
 
     void clearBuffer() {
+		init->disp.unmapMemory(stagingBufferMemory);
         init->disp.destroyBuffer(buffer, nullptr);
         init->disp.freeMemory(bufferMemory, nullptr);
+		init->disp.destroyBuffer(stagingBuffer, nullptr);
+		init->disp.freeMemory(stagingBufferMemory, nullptr);
     }
 
     void alloc(std::vector<T>& data, uint32_t numElements) {
         auto sizeOfData = static_cast<uint32_t>(sizeof(T) * numElements);
-
-        // Step 1: Create Staging Buffer (Host-visible memory)
-        VkBuffer stagingBuffer;
-        VkDeviceMemory stagingBufferMemory;
-        createBuffer(sizeOfData, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            stagingBuffer, stagingBufferMemory, init);
-
-        // Copy data to staging buffer
-        void* mappedMemory;
-        init->disp.mapMemory(stagingBufferMemory, 0, sizeOfData, 0, &mappedMemory);
-        std::memcpy(mappedMemory, data.data(), sizeOfData);
-        init->disp.unmapMemory(stagingBufferMemory);
-
-        // Step 2: Create GPU Buffer (Device-local memory)
-        createBuffer(sizeOfData, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            buffer, bufferMemory, init);
-
-        // Step 3: Copy Data from Staging Buffer to GPU Buffer
-        copyBuffer(stagingBuffer, buffer, sizeOfData, 0, 0, init, commandPool, computeQueue);
-
-        // Step 4: Cleanup Staging Buffer
-        init->disp.destroyBuffer(stagingBuffer, nullptr);
-        init->disp.freeMemory(stagingBufferMemory, nullptr);
+        std::memcpy(memMap, data.data(), sizeOfData);
+        allocator->copyBuffer(stagingBuffer, buffer, sizeOfData, 0, 0, true);
+		std::memset(memMap, 0, sizeOfData);
     }
 
     void downloadBuffer(std::vector<T>& data, uint32_t numElements) {
         VkDeviceSize bufferSize = sizeof(T) * numElements;
-
-        // Step 1: Create a Staging Buffer (Host-visible)
-        VkBuffer stagingBuffer;
-        VkDeviceMemory stagingBufferMemory;
-        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            stagingBuffer, stagingBufferMemory, init);
-
-        // Step 2: Copy GPU Buffer to Staging Buffer
-        copyBuffer(buffer, stagingBuffer, bufferSize, 0, 0, init, commandPool, computeQueue);
-
-        // Step 3: Map Memory and Read Data
-        init->disp.mapMemory(stagingBufferMemory, 0, bufferSize, 0, &memMap);
+        allocator->copyBuffer(buffer, stagingBuffer, bufferSize, 0, 0, true);
         data.resize(numElements);
         std::memcpy(data.data(), memMap, bufferSize);
-        init->disp.unmapMemory(stagingBufferMemory);
-
-        // Step 4: Cleanup Staging Buffer
-        init->disp.destroyBuffer(stagingBuffer, nullptr);
-        init->disp.freeMemory(stagingBufferMemory, nullptr);
+		std::memset(memMap, 0, bufferSize);
     }
 
     ~StandaloneBuffer() {
@@ -245,114 +463,92 @@ template<typename T>
 struct MemPool {
     VkBuffer buffer;               // Single buffer for all allocations on GPU
     VkDeviceMemory memory;         // Backing memory on GPU
-
+    
     // persistent staging buffer for efficiency. We should avoid allocating new memory whenever we can.
     // Not really the best solution, cause for every MemPool, 
     // we now have two memories of the same size that's taking up space in the computer... but eeh
     VkBuffer stagingBuffer;                  // Staging buffer on CPU (same size as buffer and memory on GPU)
     VkDeviceMemory stagingMemory;            // Staging memory on CPU (same size as buffer and memory on GPU)
+    
+    VkDeviceAddress bufferDeviceAddress; // Actual pointer to the memory inside of the GPU. used when bypassDescriptors are activated
 
-    //VkDeviceAddress bufferDeviceAddress; // Actual pointer to the memory inside of the GPU. used when bypassDescriptors are activated
-
+    void* mapped = nullptr;        // Mapped pointer. But "memory" is device local. This is used to read from index
     Init* init;                    // Vulkan initialization context
     VkDeviceSize alignment;        // Buffer alignment requirement
     VkDeviceSize capacity;         // Total capacity in bytes
     VkDeviceSize offset = 0;       // Current allocation offset
 
-    VkQueue computeQueue;
-    VkCommandPool commandPool;
-
     std::vector<Buffer<T>> buffers; // Track all allocated buffers
     bool bypassDescriptors;
+
+    std::shared_ptr<Allocator> allocator;
 
     // maxElements means number of individual elements of type T inside of all the buffers. 
     // Meaning, if maxElements is set to 10, pool can sustain 10 buffers with 1 float each (if T = float).
     // But only 2 buffers with 5 floats each.
-    MemPool(Init* init, uint32_t maxElements, bool bypassDescriptors = false) : init(init), bypassDescriptors(bypassDescriptors) {
+    MemPool(Init* init, uint32_t maxElements, bool bypassDescriptors = false, std::shared_ptr<Allocator>& allocator = nullptr) : init(init), bypassDescriptors(bypassDescriptors), allocator(allocator) {
         // Query alignment requirement for storage buffers
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(init->device.physical_device, &props);
         alignment = props.limits.minStorageBufferOffsetAlignment;
 
+		if (maxElements == 0) {
+			std::cerr << "maxElements cannot be 0" << std::endl;
+			return;
+		}
+
         // Calculate total size with alignment
         capacity = maxElements * sizeof(T);
         capacity = (capacity + alignment - 1) & ~(alignment - 1);
-
+        
         // Create CPU staging buffer (CPU visible, low-performance)
-        createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            stagingBuffer, stagingMemory, init);
+        auto stageBuff = allocator->createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		stagingBuffer = stageBuff.first;
+		stagingMemory = stageBuff.second;
 
-        /* This is disabled for now, as it requires a vulkan extension to run. */
+		// Map the staging buffer memory
+		init->disp.mapMemory(stagingMemory, 0, capacity, 0, &mapped);
 
-        // Create GPU buffer (Device-local, high-performance) (We use buffer device address to send data to GPU, bypassing descriptors)
-        //if (bypassDescriptors) {
-        //    createBuffer(capacity,
-        //        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        //        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        //        buffer, memory, init, false);
-        //
-        //    // Declare function pointer
-        //    PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR = nullptr;
-        //
-        //    // Load it after device creation
-        //    vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
-        //        vkGetDeviceProcAddr(init->device, "vkGetBufferDeviceAddressKHR");
-        //
-        //    if (!vkGetBufferDeviceAddressKHR) {
-        //        std::cerr << "Failed to load vkGetBufferDeviceAddressKHR!" << std::endl;
-        //        //return -1;
-        //    }
-        //
-        //    VkBufferDeviceAddressInfoKHR info = {};
-        //    info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_KHR;
-        //    info.buffer = buffer;
-        //    bufferDeviceAddress = vkGetBufferDeviceAddressKHR(init->device, &info);
-        //}
-
-		// create high-performance buffer on the GPU
-        createBuffer(capacity,
+        auto buff = allocator->createBuffer(capacity,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            buffer, memory, init);
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		buffer = buff.first;
+		memory = buff.second;
     }
 
     MemPool() {};
 
     ~MemPool() {
-        //init->disp.unmapMemory(memory);
+        init->disp.unmapMemory(stagingMemory);
         init->disp.destroyBuffer(buffer, nullptr);
         init->disp.freeMemory(memory, nullptr);
         init->disp.destroyBuffer(stagingBuffer, nullptr);
         init->disp.freeMemory(stagingMemory, nullptr);
     }
 
-	// autoBind automatically assigns the binding index of the storage buffer in whichever shader is using it. 
-    // (set = 0, binding = x) Buffer, where x is the binding index.
-	// if you don't wish to automatically bind buffers to incremented indices, you can set autoBind to false and manually set the indices.
+	size_t size() {
+		return buffers.size();
+	}
+
     bool push_back(const std::vector<T>& data, bool autoBind = true) {
         auto bindingIndex = buffers.size();
         const VkDeviceSize dataSize = data.size() * sizeof(T);
-
-		// vulkan's requirement for alignment for storage buffer objects
         const VkDeviceSize alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
 
         // Check if there's enough space
         if (offset + alignedSize > capacity) {
-            return false; // Out of memory
+			grow(2);
         }
 
         // Step 1: Copy Data to Staging Buffer
-        void* mappedMemory;
-        init->disp.mapMemory(stagingMemory, 0, alignedSize, 0, &mappedMemory);
-        std::memcpy(mappedMemory, data.data(), dataSize);
-
+        std::memcpy(mapped, data.data(), dataSize);
+        
         // Step 2: Copy Staging Buffer to GPU Buffer
-        copyBuffer(stagingBuffer, buffer, alignedSize, 0, offset, init, commandPool, computeQueue);
+        allocator->copyBuffer(stagingBuffer, buffer, alignedSize, 0, offset, true);
 
         // Clear the staging buffer memory
-        std::memset(mappedMemory, 0, alignedSize);
-        init->disp.unmapMemory(stagingMemory);
+        std::memset(mapped, 0, alignedSize);
 
         // Create a Buffer entry
         Buffer<T> newBuffer;
@@ -362,7 +558,7 @@ struct MemPool {
         if (autoBind && !bypassDescriptors) {
             newBuffer.createDescriptors(bindingIndex);
         }
-        else if (bypassDescriptors && !autoBind) {
+        else if (bypassDescriptors && !autoBind){
             //newBuffer.bufferDeviceAddress = bufferDeviceAddress;
         }
         buffers.push_back(newBuffer);
@@ -382,19 +578,126 @@ struct MemPool {
         VkDeviceSize dataSize = buf.numElements * sizeof(T);
         const VkDeviceSize alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
 
-        // Step 2: Copy Data from GPU Buffer to Staging Buffer
-        copyBuffer(buffer, stagingBuffer, dataSize, buf.offset, 0, init, commandPool, computeQueue);
-
-        // Step 3: Map Memory and Read Data
-        void* mappedMemory;
-        init->disp.mapMemory(stagingMemory, 0, dataSize, 0, &mappedMemory);
+        // Copy Data from GPU Buffer to Staging Buffer
+        allocator->copyBuffer(buffer, stagingBuffer, dataSize, buf.offset, 0);
 
         std::vector<T> output(buf.numElements);
-        std::memcpy(output.data(), mappedMemory, dataSize);
-        std::memset(mappedMemory, 0, alignedSize);
-        init->disp.unmapMemory(stagingMemory);
+        std::memcpy(output.data(), mapped, dataSize);
+        std::memset(mapped, 0, alignedSize);
 
         return output;
+    }
+
+	void resize(int newSize) {
+        // Calculate total size with alignment
+        capacity = newSize * sizeof(T);
+        capacity = (capacity + alignment - 1) & ~(alignment - 1);
+
+		auto newBuffer = allocator->createBuffer(capacity,
+			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		allocator->copyBuffer(buffer, newBuffer.first, capacity, 0, 0, true);
+
+		init->disp.destroyBuffer(buffer, nullptr);
+		init->disp.freeMemory(memory, nullptr);
+
+		buffer = newBuffer.first;
+		memory = newBuffer.second;
+
+        for (auto& buffer : buffers) {
+            buffer.buffer = newBuffer.first;
+        }
+	}
+
+    void grow(int factor) {
+        // Calculate total size with alignment
+        auto oldCapacity = capacity;
+
+        capacity = (buffers.size() + 10) * factor * sizeof(T);
+        capacity = (capacity + alignment - 1) & ~(alignment - 1);
+
+        auto newBuffer = allocator->createBuffer(capacity,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        allocator->copyBuffer(buffer, newBuffer.first, oldCapacity, 0, 0, true);
+
+        init->disp.destroyBuffer(buffer, nullptr);
+        init->disp.freeMemory(memory, nullptr);
+
+        buffer = newBuffer.first;
+        memory = newBuffer.second;
+
+        for (auto& buffer : buffers) {
+			buffer.buffer = newBuffer.first;
+        }
+    }
+
+	std::vector<T> pop_back() {
+		if (buffers.empty()) {
+			throw std::out_of_range("No buffers to pop");
+		}
+		auto buf = buffers.back();
+		auto dataSize = buf.numElements * sizeof(T);
+		auto alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
+
+		allocator->copyBuffer(buffer, stagingBuffer, dataSize, buf.offset, 0);
+
+		auto data = std::vector<T>(buf.numElements);
+		std::memcpy(data.data(), mapped, dataSize);
+		std::memset(mapped, 0, alignedSize);
+		buffers.pop_back();
+		offset -= alignedSize;
+
+		return data;
+	}
+
+    std::vector<T> erase(uint32_t index) {
+        if (index >= buffers.size()) {
+            throw std::out_of_range("Index out of range");
+        }
+        auto& buf = buffers[index];
+        auto dataSize = buf.numElements * sizeof(T);
+        auto alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
+        // Copy Data from GPU Buffer to Staging Buffer
+        allocator->copyBuffer(buffer, stagingBuffer, dataSize, buf.offset, 0, true);
+        std::vector<T> output(buf.numElements);
+        std::memcpy(output.data(), mapped, dataSize);
+        std::memset(mapped, 0, alignedSize);
+
+        // free the blob of empty memory, push the remaining memory towards the left and zero out the tail of straggling memory
+		allocator->freeMemory(buffer, memory, ((buf.offset + alignment - 1) & ~(alignment - 1)), alignedSize);
+        
+        // Remove the buffer from the vector
+		buffers.erase(buffers.begin() + index);
+		
+        // Update offset for next allocation
+		offset -= alignedSize;
+        // update binding index of the remaining buffers. You need to recreate descriptor sets after this. erase is a trash operation, I know.
+        for (size_t in = index; in < buffers.size(); ++in) {
+			buffers[in].createDescriptors(buffers[in].bindingIndex - 1);
+		}
+		// Update the offset of the remaining buffers
+		for (size_t i = index; i < buffers.size(); ++i) {
+			buffers[i].offset -= alignedSize;
+		}
+
+		return output;
+    }
+
+    void insert(uint32_t index, const std::vector<T>& data) {
+        if (index > buffers.size()) {
+            throw std::out_of_range("Index out of range");
+        }
+        auto bindingIndex = buffers.size();
+        const VkDeviceSize dataSize = data.size() * sizeof(T);
+        const VkDeviceSize alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
+        // Check if there's enough space
+        if (offset + alignedSize > capacity) {
+            return; // Out of memory
+        }
+
+
     }
 };
 
@@ -568,6 +871,12 @@ public:
         }
         numInputs = num_inputs;
 
+        create_descriptors();
+        create_pipeline();
+    }
+
+    void updateBuffers() {
+        numInputs = buffers.size();
         create_descriptors();
         create_pipeline();
     }

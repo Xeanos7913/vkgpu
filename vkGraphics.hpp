@@ -40,33 +40,33 @@ struct Init {
     vkb::DispatchTable disp;
 
     struct func {
-        void (*func)(void*);
-        void* ptr;
+		void (*func)(void*);
+		void* ptr;
     };
 
-    std::vector<func> funcs;
+	std::vector<func> funcs;
 
     template<typename T>
-    static void invokeFunc(void* p) {
-        static_cast<T*>(p)->destructor();
-    }
+	static void invokeFunc(void* p) {
+		static_cast<T*>(p)->destructor();
+	}
 
-    template<typename T>
-    void addObject(T* object) {
-        funcs.push_back({ &invokeFunc<T>, static_cast<void*>(object) });
-    }
+	template<typename T>
+	void addObject(T* object) {
+		funcs.push_back({ &invokeFunc<T>, static_cast<void*>(object) });
+	}
 
-    void destroy() {
-        for (auto& f : funcs) {
-            f.func(f.ptr);
-        }
-        funcs.clear();
-    }
+	void destroy() {
+		for (auto& f : funcs) {
+			f.func(f.ptr);
+		}
+		funcs.clear();
+	}
 
-    Init() {};
+	Init() {};
     Init(vkb::Instance instance, vkb::InstanceDispatchTable inst_disp, vkb::Device device, vkb::DispatchTable disp) :
         instance(instance), inst_disp(inst_disp), device(device), disp(disp) {
-    }
+	}
     ~Init() {
         //destroy();
     }
@@ -83,38 +83,35 @@ uint32_t get_memory_index(Init& init, const uint32_t type_bits, VkMemoryProperty
 }
 
 struct Allocator {
-
+    
     Allocator(Init* init) : init(init) {
         commandBuffers.resize(1);
         get_queues();
-        create_command_pool();
+		create_command_pool();
     };
 
     Allocator() {};
 
     ~Allocator() {
+
+        for (auto& mem : allocated) {
+            killMemory(mem.first, mem.second);
+        }
+
         if (!commandBuffers.empty()) {
             init->disp.freeCommandBuffers(commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
-            commandBuffers.clear();
+			commandBuffers.clear();
         }
 
-        for (auto& [buf, mem] : allocated) {
-            killMemory(buf, mem);
-        }
-
-        for (auto& [im, mem] : images) {
-            killImage(im, mem);
-        }
-
-        init->disp.destroyCommandPool(commandPool, nullptr);
+		init->disp.destroyCommandPool(commandPool, nullptr);
     }
-
+    
     size_t getAlignmemt() const {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(init->device.physical_device, &props);
-        return props.limits.minStorageBufferOffsetAlignment;
-    }
-
+		return props.limits.minStorageBufferOffsetAlignment;
+	}
+    
     Allocator(Allocator& other) {
         init = other.init;
         allocQueue = other.allocQueue;
@@ -132,9 +129,9 @@ struct Allocator {
         init->disp.freeMemory(memory, nullptr);
     }
 
-    std::pair<VkBuffer, VkDeviceMemory> createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool usingDescriptors = true) {
+    std::pair<VkBuffer, VkDeviceMemory> createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool addToDeletionQueue = true) {
         VkBuffer buffer{};
-        VkDeviceMemory bufferMemory{};
+		VkDeviceMemory bufferMemory{};
 
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -150,12 +147,12 @@ struct Allocator {
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memRequirements.size;
         allocInfo.memoryTypeIndex = get_memory_index(*init, memRequirements.memoryTypeBits, properties);
-
+        
         VkMemoryAllocateFlagsInfo allocFlagsInfo{};
         allocFlagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
         allocFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 
-        allocInfo.pNext = &allocFlagsInfo;
+		allocInfo.pNext = &allocFlagsInfo;
 
         if (init->disp.allocateMemory(&allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
             throw std::runtime_error("could not allocate memory");
@@ -163,52 +160,55 @@ struct Allocator {
         if (init->disp.bindBufferMemory(buffer, bufferMemory, 0) != VK_SUCCESS) {
             throw std::runtime_error("could not bind memory");
         }
-        allocated.emplace_back(buffer, bufferMemory);
+        if (addToDeletionQueue) {
+            allocated.emplace_back(buffer, bufferMemory);
+        }
+
         return { buffer, bufferMemory };
     };
 
-    std::pair<VkImage, VkDeviceMemory> createImage(VkDeviceSize width, VkDeviceSize height, uint32_t mipLevels, VkImageUsageFlags usage, VkImageType imageType, VkMemoryPropertyFlags properties, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM, VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, VkSharingMode sharingMode = VK_SHARING_MODE_EXCLUSIVE) {
-        VkImage image{};
-        VkDeviceMemory imageMemory{};
-        VkImageCreateInfo imageInfo{};
-        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        imageInfo.imageType = imageType;
-        imageInfo.extent.width = static_cast<uint32_t>(width);
-        imageInfo.extent.height = static_cast<uint32_t>(height);
-        imageInfo.extent.depth = 1;
-        imageInfo.mipLevels = mipLevels;
-        imageInfo.arrayLayers = 1;
-        imageInfo.format = format;
-        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.initialLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        imageInfo.usage = usage;
-        imageInfo.samples = samples;
-        imageInfo.sharingMode = sharingMode;
-        init->disp.createImage(&imageInfo, nullptr, &image);
-        VkMemoryRequirements memRequirements;
-        init->disp.getImageMemoryRequirements(image, &memRequirements);
-        VkMemoryAllocateInfo allocInfo{};
-        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocInfo.allocationSize = memRequirements.size;
-        allocInfo.memoryTypeIndex = get_memory_index(*init, memRequirements.memoryTypeBits, properties);
-        if (init->disp.allocateMemory(&allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
-            throw std::runtime_error("could not allocate memory");
-        }
-        if (init->disp.bindImageMemory(image, imageMemory, 0) != VK_SUCCESS) {
-            throw std::runtime_error("could not bind memory");
-        }
+	std::pair<VkImage, VkDeviceMemory> createImage(VkDeviceSize width, VkDeviceSize height, uint32_t mipLevels, VkImageUsageFlags usage, VkImageType imageType, VkMemoryPropertyFlags properties, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM,VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, VkSharingMode sharingMode = VK_SHARING_MODE_EXCLUSIVE) {
+		VkImage image{};
+		VkDeviceMemory imageMemory{};
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = imageType;
+		imageInfo.extent.width = static_cast<uint32_t>(width);
+		imageInfo.extent.height = static_cast<uint32_t>(height);
+		imageInfo.extent.depth = 1;
+		imageInfo.mipLevels = mipLevels;
+		imageInfo.arrayLayers = 1;
+		imageInfo.format = format;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		imageInfo.usage = usage;
+		imageInfo.samples = samples;
+		imageInfo.sharingMode = sharingMode;
+		init->disp.createImage(&imageInfo, nullptr, &image);
+		VkMemoryRequirements memRequirements;
+		init->disp.getImageMemoryRequirements(image, &memRequirements);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memRequirements.size;
+		allocInfo.memoryTypeIndex = get_memory_index(*init, memRequirements.memoryTypeBits, properties);
+		if (init->disp.allocateMemory(&allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+			throw std::runtime_error("could not allocate memory");
+		}
+		if (init->disp.bindImageMemory(image, imageMemory, 0) != VK_SUCCESS) {
+			throw std::runtime_error("could not bind memory");
+		}
         images.emplace_back(image, imageMemory);
-        return { image, imageMemory };
-    }
+		return { image, imageMemory };
+	}
 
     void fillBuffer(VkBuffer buffer, VkDeviceMemory memory, uint32_t data, VkDeviceSize offset = 0, VkDeviceSize range = VK_WHOLE_SIZE) {
-        auto cmd = beginSingleTimeCommands();
+		auto cmd = beginSingleTimeCommands();
         vkCmdFillBuffer(commandBuffers[cmd], buffer, offset, range, data);
-        endSingleTimeCommands(true, false);
+		endSingleTimeCommands(true, false);
     }
 
-    // avoid as much as possible, this kills performance. But if you need to free memory, this is the way to do it.
-    void freeMemory(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize range) {
+	// avoid as much as possible, this kills performance. But if you need to free memory, this is the way to do it.
+    void freeMemory(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize range) {  
         // Step 1: Create a staging buffer to temporarily hold the data
         VkDeviceSize bufferSize;
 
@@ -237,7 +237,7 @@ struct Allocator {
             sequentialCopyBuffer(stagingBuffer, buffer, offset, 0, 0);
         }
 
-        if (remainingSize > 0) {
+        if (remainingSize > 0) {  
             sequentialCopyBuffer(stagingBuffer, buffer, remainingSize, offset, offset);
         }
 
@@ -248,7 +248,7 @@ struct Allocator {
         init->disp.freeMemory(stagingMemory, nullptr);
     }
 
-    // this overrides the memory in offset -> insertSize with toInsert(0 -> insertSize).
+	// this overrides the memory in offset -> insertSize with toInsert(0 -> insertSize).
     void replaceMemory(VkBuffer& buffer, VkDeviceMemory& memory, VkBuffer toInsert, VkDeviceSize insertSize, VkDeviceSize offset) {
         // Step 1: Get memory requirements
         VkMemoryRequirements bufferReq;
@@ -273,7 +273,7 @@ struct Allocator {
             sequentialCopyBuffer(buffer, stagingBuffer, remainingSize, offset, offset + insertSize);
         }
 
-        sequentialCopyBuffer(stagingBuffer, buffer, totalSize, 0, 0);
+		sequentialCopyBuffer(stagingBuffer, buffer, totalSize, 0, 0);
 
         submitAllCommands(true);
 
@@ -305,32 +305,32 @@ struct Allocator {
         init->disp.freeMemory(stagingMemory, nullptr);
     }
 
-    // this is a defragmenter. It will copy the good data from the original buffer to a new buffer, and then free the original buffer, killing the stale memory
+	// this is a defragmenter. It will copy the good data from the original buffer to a new buffer, and then free the original buffer, killing the stale memory
     void defragment(VkBuffer& buffer, VkDeviceMemory& memory, std::vector<std::pair<VkDeviceSize, VkDeviceSize>>& aliveMem) {
-        // create new staging buffer which will replace the original buffer
-        VkDeviceSize bufferSize;
-        // Get memory requirements for the buffer
-        VkMemoryRequirements memRequirements;
-        init->disp.getBufferMemoryRequirements(buffer, &memRequirements);
-        bufferSize = memRequirements.size;
-        // Create the clean buffer
-        auto [stagingBuffer, stagingMemory] = createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		// create new staging buffer which will replace the original buffer
+		VkDeviceSize bufferSize;
+		// Get memory requirements for the buffer
+		VkMemoryRequirements memRequirements;
+		init->disp.getBufferMemoryRequirements(buffer, &memRequirements);
+		bufferSize = memRequirements.size;
+		// Create the clean buffer
+		auto [stagingBuffer, stagingMemory] = createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         VkDeviceSize runningOffset = 0;
         // copy all the good buffers into the staging buffer, one after the other
-        for (auto& [offset, range] : aliveMem) {
-            // copy the data from the original buffer to the new one
-            sequentialCopyBuffer(buffer, stagingBuffer, range, offset, runningOffset);
-            runningOffset += range;
-        }
+		for (auto& [offset, range] : aliveMem) {
+			// copy the data from the original buffer to the new one
+			sequentialCopyBuffer(buffer, stagingBuffer, range, offset, runningOffset);
+			runningOffset += range;
+		}
 
-        // copy the curated data from the staging buffer to the original buffer
-        sequentialCopyBuffer(stagingBuffer, buffer, bufferSize, 0, 0);
+		// copy the curated data from the staging buffer to the original buffer
+		sequentialCopyBuffer(stagingBuffer, buffer, bufferSize, 0, 0);
 
-        submitAllCommands(true);
+		submitAllCommands(true);
 
-        init->disp.destroyBuffer(stagingBuffer, nullptr);
-        init->disp.freeMemory(stagingMemory, nullptr);
+		init->disp.destroyBuffer(stagingBuffer, nullptr);
+		init->disp.freeMemory(stagingMemory, nullptr);
     }
 
     void transitionImageLayout(
@@ -398,30 +398,30 @@ struct Allocator {
         endSingleTimeCommands(async);
     }
 
-    void sequentialCopyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
+	void sequentialCopyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
         auto cmd = beginSingleTimeCommands();
-        VkBufferCopy copyRegion{};
-        copyRegion.size = size;
-        copyRegion.dstOffset = dstOffset;
-        copyRegion.srcOffset = srcOffset;
-        vkCmdCopyBuffer(commandBuffers[cmd], srcBuffer, dstBuffer, 1, &copyRegion);
+		VkBufferCopy copyRegion{};
+		copyRegion.size = size;
+		copyRegion.dstOffset = dstOffset;
+		copyRegion.srcOffset = srcOffset;
+		vkCmdCopyBuffer(commandBuffers[cmd], srcBuffer, dstBuffer, 1, &copyRegion);
         endSingleTimeCommands(true, false);
-    }
+	}
 
     // only supports sqare images
-    void copyImage(VkImage srcImage, VkImage dstImage, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
-        auto cmd = beginSingleTimeCommands();
-        VkImageCopy copyRegion{};
-        copyRegion.extent.width = static_cast<uint32_t>(size);
-        copyRegion.extent.height = static_cast<uint32_t>(size);
-        copyRegion.extent.depth = 1;
-        copyRegion.dstOffset.x = static_cast<int32_t>(dstOffset);
-        copyRegion.dstOffset.y = static_cast<int32_t>(dstOffset);
-        copyRegion.srcOffset.x = static_cast<int32_t>(srcOffset);
-        copyRegion.srcOffset.y = static_cast<int32_t>(srcOffset);
-        vkCmdCopyImage(commandBuffers[cmd], srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
-        endSingleTimeCommands();
-    }
+	void copyImage(VkImage srcImage, VkImage dstImage, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
+		auto cmd = beginSingleTimeCommands();
+		VkImageCopy copyRegion{};
+		copyRegion.extent.width = static_cast<uint32_t>(size);
+		copyRegion.extent.height = static_cast<uint32_t>(size);
+		copyRegion.extent.depth = 1;
+		copyRegion.dstOffset.x = static_cast<int32_t>(dstOffset);
+		copyRegion.dstOffset.y = static_cast<int32_t>(dstOffset);
+		copyRegion.srcOffset.x = static_cast<int32_t>(srcOffset);
+		copyRegion.srcOffset.y = static_cast<int32_t>(srcOffset);
+		vkCmdCopyImage(commandBuffers[cmd], srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+		endSingleTimeCommands();
+	}
 
     // does not support mipmaps or array textures
     void copyBufferToImage2D(VkBuffer srcBuffer, VkImage dstImage, uint32_t width, uint32_t height) {
@@ -453,12 +453,12 @@ struct Allocator {
             &region
         );
 
-        endSingleTimeCommands(true, true, false);
+		endSingleTimeCommands(true, true, false);
     }
 
-    // this begins the command buffer recording process. Just record the commands in between this function's call and the submitSingleTimeCmd call
-    // submitSingleTimeCmd will NOT automatically end the command buffer!!
-    VkCommandBuffer getSingleTimeCmd(bool useGraphicsQueue = false) const {
+	// this begins the command buffer recording process. Just record the commands in between this function's call and the submitSingleTimeCmd call
+	// submitSingleTimeCmd will NOT automatically end the command buffer!!
+	VkCommandBuffer getSingleTimeCmd(bool useGraphicsQueue = false) const {
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -479,12 +479,12 @@ struct Allocator {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
         init->disp.beginCommandBuffer(commandBuffer, &beginInfo);
-        return commandBuffer;
-    }
+		return commandBuffer;
+	}
 
-    void submitSingleTimeCmd(VkCommandBuffer cmd, bool async = true, bool useGraphicsQueue = false) {
-        SubmitSingleTimeCommand(cmd, async, useGraphicsQueue);
-    }
+	void submitSingleTimeCmd(VkCommandBuffer cmd, bool async = true, bool useGraphicsQueue = false) {
+		SubmitSingleTimeCommand(cmd, async, useGraphicsQueue);
+	}
 
     Init* init;
     VkCommandPool commandPool;
@@ -502,11 +502,11 @@ private:
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         if (!useGraphicsQueue) {
             allocInfo.commandPool = commandPool;
-        }
-        else {
-            allocInfo.commandPool = graphicsPool;
-        }
-
+		}
+		else {
+			allocInfo.commandPool = graphicsPool;
+		}
+        
         allocInfo.commandBufferCount = 1;
 
         VkCommandBuffer commandBuffer;
@@ -518,25 +518,25 @@ private:
 
         init->disp.beginCommandBuffer(commandBuffer, &beginInfo);
         commandBuffers.push_back(commandBuffer);
-        return commandBuffers.size() - 1; // return the index at which we just pushed the command buffer
+		return commandBuffers.size() - 1; // return the index at which we just pushed the command buffer
     }
 
     int SubmitSingleTimeCommand(VkCommandBuffer commandBuffer, bool async = true, bool useGraphicsQueue = false) const {
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
+		VkSubmitInfo submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &commandBuffer;
         if (async) {
             if (useGraphicsQueue) {
-                init->disp.queueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+			    init->disp.queueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
                 init->disp.queueWaitIdle(graphicsQueue);
                 init->disp.freeCommandBuffers(graphicsPool, 1, &commandBuffer);
-            }
-            else if (!useGraphicsQueue) {
-                init->disp.queueSubmit(allocQueue, 1, &submitInfo, VK_NULL_HANDLE);
+		    }
+		    else if (!useGraphicsQueue) {
+			    init->disp.queueSubmit(allocQueue, 1, &submitInfo, VK_NULL_HANDLE);
                 init->disp.queueWaitIdle(allocQueue);
-                init->disp.freeCommandBuffers(commandPool, 1, &commandBuffer);
-            }
+				init->disp.freeCommandBuffers(commandPool, 1, &commandBuffer);
+		    }
         }
         else {
             if (useGraphicsQueue) {
@@ -548,13 +548,13 @@ private:
             init->disp.deviceWaitIdle();
 
             if (useGraphicsQueue) {
-                init->disp.freeCommandBuffers(graphicsPool, 1, &commandBuffer);
-            }
-            else {
-                init->disp.freeCommandBuffers(commandPool, 1, &commandBuffer);
-            }
+			    init->disp.freeCommandBuffers(graphicsPool, 1, &commandBuffer);
+		    }
+		    else {
+			    init->disp.freeCommandBuffers(commandPool, 1, &commandBuffer);
+		    }
         }
-        return 0;
+		return 0;
     }
 
     void endSingleTimeCommands(bool async = false, bool dispatch = true, bool dispathOnGraphics = false) {
@@ -568,12 +568,12 @@ private:
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &cmd;
-            if (dispathOnGraphics) {
-                init->disp.queueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-            }
-            else {
-                init->disp.queueSubmit(allocQueue, 1, &submitInfo, VK_NULL_HANDLE);
-            }
+			if (dispathOnGraphics) {
+				init->disp.queueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+			}
+			else {
+				init->disp.queueSubmit(allocQueue, 1, &submitInfo, VK_NULL_HANDLE);
+			}
 
             if (!async) {
                 init->disp.deviceWaitIdle();
@@ -581,7 +581,7 @@ private:
             else {
                 if (!dispathOnGraphics) {
                     init->disp.queueWaitIdle(allocQueue);
-                }
+				}
                 else {
                     init->disp.queueWaitIdle(graphicsQueue);
                 }
@@ -598,15 +598,15 @@ private:
 
     void submitAllCommands(bool async = false) {
         if (commandBuffers.empty()) return;
-        //commandBuffers.erase(commandBuffers.begin()); // the first command buffer is apparently invalid?! will have to fix later, right now, I'm exhausted.
+		//commandBuffers.erase(commandBuffers.begin()); // the first command buffer is apparently invalid?! will have to fix later, right now, I'm exhausted.
         VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = commandBuffers.size();
-        submitInfo.pCommandBuffers = commandBuffers.data();
-        init->disp.queueSubmit(allocQueue, 1, &submitInfo, VK_NULL_HANDLE);
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = commandBuffers.size();
+            submitInfo.pCommandBuffers = commandBuffers.data();
+            init->disp.queueSubmit(allocQueue, 1, &submitInfo, VK_NULL_HANDLE);
         if (async) { init->disp.queueWaitIdle(allocQueue); }    // this stalls the transfer queue, but not the whole device.
-        else { init->disp.deviceWaitIdle(); } 		// this stalls the whole device. This is terrible. But it's useful for stuff where you need to wait for the GPU to finish before you can do anything else.
-
+		else { init->disp.deviceWaitIdle(); } 		// this stalls the whole device. This is terrible. But it's useful for stuff where you need to wait for the GPU to finish before you can do anything else.
+		
         init->disp.freeCommandBuffers(commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
         commandBuffers.clear();
     }
@@ -642,14 +642,14 @@ struct StandaloneBuffer {
     VkBuffer buffer{};
     VkDeviceMemory bufferMemory{};
 
-    VkDeviceAddress bufferAddress{}; // Address of the buffer in GPU memory.
+	VkDeviceAddress bufferAddress{}; // Address of the buffer in GPU memory.
 
     VkBuffer stagingBuffer{};
-    VkDeviceMemory stagingBufferMemory{}; // Staging memory on CPU (same size as buffer and memory on GPU)
+	VkDeviceMemory stagingBufferMemory{}; // Staging memory on CPU (same size as buffer and memory on GPU)
 
     VkDeviceSize alignment;
     VkDeviceSize capacity;
-    uint32_t numElements = 0; // Number of elements in this buffer
+	uint32_t numElements = 0; // Number of elements in this buffer
 
     // stuff you need to send to pipeline creation:
     VkDescriptorSetLayoutBinding binding{};
@@ -657,16 +657,16 @@ struct StandaloneBuffer {
     VkDescriptorBufferInfo desc_buf_info{};
     uint32_t bindingIndex;
 
-    // for transfer operations to be done on seperate queue
-    Allocator* allocator;
+	// for transfer operations to be done on seperate queue
+	Allocator* allocator;
 
-    VkShaderStageFlagBits flags = VK_SHADER_STAGE_COMPUTE_BIT;
+	VkShaderStageFlagBits flags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     void* memMap;
 
-    // Signal to all resources using this buffer. The current descriptor set is invalid and needs to be updated and this varieable needs to be set to false
-    Signal<10> descUpdateQueued;
-
+	// Signal to all resources using this buffer. The current descriptor set is invalid and needs to be updated and this varieable needs to be set to false
+	Signal<10> descUpdateQueued;
+    
     // Copy assignment operator
     StandaloneBuffer& operator=(const StandaloneBuffer& other) {
         if (this != &other) {
@@ -706,7 +706,7 @@ struct StandaloneBuffer {
         flags(other.flags),
         memMap(other.memMap),
         descUpdateQueued(other.descUpdateQueued),
-        bufferAddress(other.bufferAddress) {
+        bufferAddress(other.bufferAddress){
     }
 
     StandaloneBuffer(size_t numElements, Allocator* allocator, VkShaderStageFlagBits flags = VK_SHADER_STAGE_COMPUTE_BIT) : allocator(allocator), flags(flags), numElements(numElements) {
@@ -714,12 +714,18 @@ struct StandaloneBuffer {
     }
 
     StandaloneBuffer(std::vector<T>& data, Allocator* allocator, VkShaderStageFlagBits flags = VK_SHADER_STAGE_COMPUTE_BIT) : allocator(allocator), flags(flags) {
-        numElements = static_cast<uint32_t>(data.size());
+		numElements = static_cast<uint32_t>(data.size());
         init();
         alloc(data);
     }
 
     StandaloneBuffer() : allocator(nullptr) {}
+
+    ~StandaloneBuffer() {
+        allocator->init->disp.unmapMemory(stagingBufferMemory);
+        allocator->killMemory(stagingBuffer, stagingBufferMemory);
+        allocator->killMemory(buffer, bufferMemory);
+    }
 
     void init() {
         VkPhysicalDeviceProperties props{};
@@ -742,16 +748,16 @@ struct StandaloneBuffer {
         bufferMemory = buff.second;
         allocator->init->disp.mapMemory(stagingBufferMemory, 0, capacity, 0, &memMap);
 
-        VkBufferDeviceAddressInfoEXT bufferInfo{};
-        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
-        bufferInfo.buffer = buffer;
-        bufferInfo.pNext = nullptr;
+		VkBufferDeviceAddressInfoEXT bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
+		bufferInfo.buffer = buffer;
+		bufferInfo.pNext = nullptr;
 
-        bufferAddress = allocator->init->disp.getBufferDeviceAddress(&bufferInfo);
+		bufferAddress = allocator->init->disp.getBufferDeviceAddress(&bufferInfo);
         std::cout << "wefwef\n";
     }
 
-    VkDeviceAddress getBufferAddress() {
+	VkDeviceAddress getBufferAddress() {
         VkBufferDeviceAddressInfoEXT bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
         bufferInfo.buffer = buffer;
@@ -759,7 +765,7 @@ struct StandaloneBuffer {
 
         bufferAddress = allocator->init->disp.getBufferDeviceAddress(&bufferInfo);
         return bufferAddress;
-    }
+	}
 
     void createDescriptors(int idx, VkShaderStageFlagBits stage) {
         binding.binding = stage;
@@ -812,31 +818,31 @@ struct StandaloneBuffer {
         }
     }
 
-    // Allocate data into the buffer. Each alloc will overwrite the previous data in the buffer.
+	// Allocate data into the buffer. Each alloc will overwrite the previous data in the buffer.
     void alloc(std::vector<T>& data) {
         auto sizeOfData = static_cast<uint32_t>(sizeof(T) * data.size());
         std::memcpy(memMap, data.data(), sizeOfData);
         allocator->copyBuffer(stagingBuffer, buffer, sizeOfData, 0, 0, true);
-        std::memset(memMap, 0, sizeOfData);
-        numElements = static_cast<uint32_t>(data.size());
+		std::memset(memMap, 0, sizeOfData);
+		numElements = static_cast<uint32_t>(data.size());
     }
 
     void grow(int factor) {
-        auto oldCapacity = capacity;
+		auto oldCapacity = capacity;
         capacity = factor * sizeof(T);
-        capacity = (capacity + alignment - 1) & ~(alignment - 1);
+		capacity = (capacity + alignment - 1) & ~(alignment - 1);
 
-        auto [buf, mem] = allocator->createBuffer(capacity, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+		auto [buf, mem] = allocator->createBuffer(capacity, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
 
-        allocator->copyBuffer(buffer, buf, oldCapacity, 0, 0, true);
+		allocator->copyBuffer(buffer, buf, oldCapacity, 0, 0, true);
 
         allocator->init->disp.destroyBuffer(buffer, nullptr);
-        allocator->init->disp.freeMemory(bufferMemory, nullptr);
-        buffer = buf;
-        bufferMemory = mem;
+		allocator->init->disp.freeMemory(bufferMemory, nullptr);
+		buffer = buf;
+		bufferMemory = mem;
 
-        getBufferAddress();
+		getBufferAddress();
 
         // the internal handles were changed. We need descriptor updates
         descUpdateQueued.trigger();
@@ -845,19 +851,19 @@ struct StandaloneBuffer {
     // newSize is size of buffer in elements, NOT bytes
     void resize(uint32_t newSize) {
         auto prevCapacity = capacity;
-        capacity = newSize * sizeof(T);
-        capacity = (capacity + alignment - 1) & ~(alignment - 1);
+		capacity = newSize * sizeof(T);
+		capacity = (capacity + alignment - 1) & ~(alignment - 1);
 
-        auto [buf, mem] = allocator->createBuffer(capacity, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
-        allocator->copyBuffer(buffer, buf, prevCapacity, 0, 0, true);
-        allocator->init->disp.destroyBuffer(buffer, nullptr);
-        allocator->init->disp.freeMemory(bufferMemory, nullptr);
+		auto [buf, mem] = allocator->createBuffer(capacity, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+		allocator->copyBuffer(buffer, buf, prevCapacity, 0, 0, true);
+		allocator->init->disp.destroyBuffer(buffer, nullptr);
+		allocator->init->disp.freeMemory(bufferMemory, nullptr);
 
-        buffer = buf;
-        bufferMemory = mem;
-        getBufferAddress();
-        // the internal handles were changed. We need descriptor updates
-        descUpdateQueued.trigger();
+		buffer = buf;
+		bufferMemory = mem;
+		getBufferAddress();
+		// the internal handles were changed. We need descriptor updates
+		descUpdateQueued.trigger();
     }
 
     size_t size() const {
@@ -865,23 +871,19 @@ struct StandaloneBuffer {
     }
 
     std::vector<T> downloadBuffer() {
-
-        VkMemoryRequirements memRequirements;
-        allocator->init->disp.getBufferMemoryRequirements(buffer, &memRequirements);
-        auto bufferSize = memRequirements.size;
-        auto numElements = static_cast<uint32_t>(bufferSize / sizeof(T));
+        
+		VkMemoryRequirements memRequirements;
+		allocator->init->disp.getBufferMemoryRequirements(buffer, &memRequirements);
+		auto bufferSize = memRequirements.size;
+		auto numElements = static_cast<uint32_t>(bufferSize / sizeof(T));
         allocator->copyBuffer(buffer, stagingBuffer, bufferSize, 0, 0, true);
 
-        std::vector<T> data;
+		std::vector<T> data; 
         data.resize(numElements);
         std::memcpy(data.data(), memMap, bufferSize);
-        std::memset(memMap, 0, bufferSize);
-        return data;
+		std::memset(memMap, 0, bufferSize);
+		return data;
     }
-
-    ~StandaloneBuffer() {
-        allocator->init->disp.unmapMemory(stagingBufferMemory);
-    };
 };
 
 // Bindless descriptor array of standaloneBuffers
@@ -891,61 +893,61 @@ struct BufferArray {
 
     uint32_t numBuffers = 1000;             // by default, 1000 buffers are supported
 
-    VkDescriptorSet descSet;
-    VkDescriptorSetLayout descSetLayout;
-    VkDescriptorPool descPool;
-    Allocator* allocator;
+	VkDescriptorSet descSet;
+	VkDescriptorSetLayout descSetLayout;
+	VkDescriptorPool descPool;
+	Allocator* allocator;
 
     uint32_t bindingIndex = 0;
 
-    BufferArray(Allocator* allocator, uint32_t bindingIndex) : allocator(allocator), bindingIndex(bindingIndex) {
+	BufferArray(Allocator* allocator, uint32_t bindingIndex) : allocator(allocator), bindingIndex(bindingIndex) {
         createDescriptorPool();
-        createDescSetLayout();
-        allocateDescSet();
+		createDescSetLayout();
+		allocateDescSet();
         allocator->init->addObject(this);
-    }
+	}
 
     BufferArray(Allocator* allocator, uint32_t bindingIndex, VkDescriptorPool sharedPool) : allocator(allocator), bindingIndex(bindingIndex), descPool(sharedPool) {
         createDescSetLayout();
-        allocateDescSet();
+		allocateDescSet();
     };
 
     BufferArray() {};
 
-    void destructor() {
-        allocator->init->disp.destroyDescriptorPool(descPool, nullptr);
+    ~BufferArray() {
         allocator->init->disp.destroyDescriptorSetLayout(descSetLayout, nullptr);
+        allocator->init->disp.destroyDescriptorPool(descPool, nullptr);
     }
 
-    void push_back(StandaloneBuffer<bufferType>& buffer) {
-        if (buffers.size() >= numBuffers) {
-            std::cout << "BufferArray: reached max number of buffers. Cannot add more.\n";
-            return;
-        }
-        buffers.push_back(std::move(buffer));
-    }
+	void push_back(StandaloneBuffer<bufferType>& buffer) {
+		if (buffers.size() >= numBuffers) {
+			std::cout << "BufferArray: reached max number of buffers. Cannot add more.\n";
+			return;
+		}
+		buffers.push_back(std::move(buffer));
+	}
 
-    void push_back(std::vector<bufferType>& data) {
-        if (buffers.size() >= numBuffers) {
-            std::cout << "BufferArray: reached max number of buffers. Cannot add more.\n";
-            return;
-        }
-        buffers.emplace_back(data, allocator);
-    }
+	void push_back(std::vector<bufferType>& data) {
+		if (buffers.size() >= numBuffers) {
+			std::cout << "BufferArray: reached max number of buffers. Cannot add more.\n";
+			return;
+		}
+		buffers.emplace_back(data, allocator);
+	}
 
-    void erase(uint32_t idx) {
-        if (idx < 0 || idx >= buffers.size()) {
-            std::cout << "BufferArray: index out of range. Cannot erase.\n";
-            return;
-        }
-        allocator->init->disp.destroyBuffer(buffers[idx].buffer, nullptr);
-        allocator->init->disp.freeMemory(buffers[idx].bufferMemory, nullptr);
-        buffers.erase(buffers.begin() + idx);
-    }
+	void erase(uint32_t idx) {
+		if (idx < 0 || idx >= buffers.size()) {
+			std::cout << "BufferArray: index out of range. Cannot erase.\n";
+			return;
+		}
+		allocator->init->disp.destroyBuffer(buffers[idx].buffer, nullptr);
+		allocator->init->disp.freeMemory(buffers[idx].bufferMemory, nullptr);
+		buffers.erase(buffers.begin() + idx);
+	}
 
-    size_t size() const {
-        return buffers.size();
-    }
+	size_t size() const {
+		return buffers.size();
+	}
 
     void createDescriptorPool() {
         VkDescriptorPoolSize pool_sizes_bindless[] =
@@ -1019,10 +1021,10 @@ template<typename T>
 struct Buffer {
     VkBuffer buffer;                      // Points to the MemPool's buffer
     VkDeviceSize offset;                  // Byte Offset within the buffer
-    uint32_t elementOffset;               // Element Offset within the buffer
+	uint32_t elementOffset;               // Element Offset within the buffer
     uint32_t numElements;                 // Number of elements in this buffer
-    VkDeviceSize alignedSize(VkDeviceSize alignment) { return (numElements * sizeof(T) + alignment - 1) & ~(alignment - 1); } // Return the aligned byte size of this buffer element
-    VkDeviceSize size() { return numElements * sizeof(T); } // Return the byte size of this buffer element
+	VkDeviceSize alignedSize(VkDeviceSize alignment) { return (numElements * sizeof(T) + alignment - 1) & ~(alignment - 1); } // Return the aligned byte size of this buffer element
+	VkDeviceSize size() { return numElements * sizeof(T); } // Return the byte size of this buffer element
 
     // Descriptor set members (used when MemPool is not using bypassDescriptors)
     uint32_t bindingIndex;
@@ -1030,7 +1032,7 @@ struct Buffer {
     VkWriteDescriptorSet wrt_desc_set{};
     VkDescriptorBufferInfo desc_buf_info{};
 
-    void createDescriptors(uint32_t bindingIdx, VkShaderStageFlags flags = VK_SHADER_STAGE_COMPUTE_BIT) {
+    void createDescriptors(uint32_t bindingIdx, VkShaderStageFlags flags= VK_SHADER_STAGE_COMPUTE_BIT) {
         bindingIndex = bindingIdx;
         binding.binding = bindingIndex;
         binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1064,7 +1066,7 @@ template<typename T>
 struct MemPool {
     VkBuffer buffer;               // Single buffer for all allocations on GPU
     VkDeviceMemory memory;         // Backing memory on GPU
-    VkDeviceAddress poolAddress;   // Address of the buffer in GPU memory.
+	VkDeviceAddress poolAddress;   // Address of the buffer in GPU memory.
 
     // persistent staging buffer for efficiency. We should avoid allocating new memory whenever we can.
     // Not really the best solution, cause for every MemPool, 
@@ -1079,7 +1081,7 @@ struct MemPool {
     VkDeviceSize alignment;        // Buffer alignment requirement
     VkDeviceSize capacity;         // Total capacity in bytes
     VkDeviceSize offset = 0;       // Current allocation byte offset
-    uint32_t elementOffset = 0;    // Current element offset (in number of elements)
+	uint32_t elementOffset = 0;    // Current element offset (in number of elements)
     VkDeviceSize occupied = 0;     // The amount of occupied memory in the buffer (its value of the same as current allocation offset, but I kept it seperate for readability purposes)
 
     std::vector<Buffer<T>> buffers; // Track all allocated buffers
@@ -1124,33 +1126,27 @@ struct MemPool {
         buffer = buff.first;
         memory = buff.second;
 
-        VkBufferDeviceAddressInfoEXT bufferInfo{};
-        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
-        bufferInfo.buffer = buffer;
-        bufferInfo.pNext = nullptr;
-        poolAddress = allocator->init->disp.getBufferDeviceAddress(&bufferInfo);
+		VkBufferDeviceAddressInfoEXT bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
+		bufferInfo.buffer = buffer;
+		bufferInfo.pNext = nullptr;
+		poolAddress = allocator->init->disp.getBufferDeviceAddress(&bufferInfo);
     }
 
     MemPool() {};
 
-
-
-    ~MemPool() {
-        allocator->init->disp.unmapMemory(stagingMemory);
-    }
-
     size_t size() {
         return buffers.size();
     }
-
-    VkDeviceAddress getBufferAddress() {
-        VkBufferDeviceAddressInfoEXT bufferInfo{};
-        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
-        bufferInfo.buffer = buffer;
-        bufferInfo.pNext = nullptr;
-        poolAddress = allocator->init->disp.getBufferDeviceAddress(&bufferInfo);
-        return poolAddress;
-    }
+    
+	VkDeviceAddress getBufferAddress() {
+		VkBufferDeviceAddressInfoEXT bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
+		bufferInfo.buffer = buffer;
+		bufferInfo.pNext = nullptr;
+		poolAddress = allocator->init->disp.getBufferDeviceAddress(&bufferInfo);
+		return poolAddress;
+	}
 
     // simple push_back operation. Quite expensive, use with caution.
     bool push_back(const std::vector<T> data, bool autoBind = true) {
@@ -1165,24 +1161,22 @@ struct MemPool {
 
         VkMemoryRequirements memRequirements{};
         allocator->init->disp.getBufferMemoryRequirements(stagingBuffer, &memRequirements);
-        auto stagingBufferSize = memRequirements.size;
+		auto stagingBufferSize = memRequirements.size;
 
-        // Step 1: Copy Data to Staging Buffer
-        if (stagingBufferSize < alignedSize) {
+        // Copy Data to Staging Buffer
+		if (stagingBufferSize < alignedSize) {
             allocator->init->disp.unmapMemory(stagingMemory);
-            allocator->init->disp.destroyBuffer(stagingBuffer, nullptr);
-            allocator->init->disp.freeMemory(stagingMemory, nullptr);
-            auto stageBuff = allocator->createBuffer(alignedSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            stagingBuffer = stageBuff.first;
-            stagingMemory = stageBuff.second;
-            allocator->init->disp.mapMemory(stagingMemory, 0, alignedSize, 0, &mapped);
-        }
+			allocator->init->disp.destroyBuffer(stagingBuffer, nullptr);
+			allocator->init->disp.freeMemory(stagingMemory, nullptr);
+			auto stageBuff = allocator->createBuffer(alignedSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+			stagingBuffer = stageBuff.first;
+			stagingMemory = stageBuff.second;
+			allocator->init->disp.mapMemory(stagingMemory, 0, alignedSize, 0, &mapped);
+		}
         std::memcpy(mapped, data.data(), dataSize);
-
-        // Step 2: Copy Staging Buffer to GPU Buffer
+        // Copy Staging Buffer to GPU Buffer
         allocator->copyBuffer(stagingBuffer, buffer, alignedSize, 0, offset, true);
-
         // Clear the staging buffer memory
         std::memset(mapped, 0, alignedSize);
 
@@ -1190,14 +1184,14 @@ struct MemPool {
         Buffer<T> newBuffer;
         newBuffer.buffer = buffer;
         newBuffer.offset = offset;
-        newBuffer.elementOffset = elementOffset;
+		newBuffer.elementOffset = elementOffset;
         newBuffer.numElements = static_cast<uint32_t>(data.size());
         newBuffer.createDescriptors(bindingIndex, flags);
         buffers.push_back(newBuffer);
 
         // Update offset for next allocation
         offset += alignedSize;
-        elementOffset += static_cast<uint32_t>(data.size());
+		elementOffset += static_cast<uint32_t>(data.size());
         return true;
     }
 
@@ -1207,7 +1201,7 @@ struct MemPool {
 
         // Check if there's enough space
         if (offset + data.capacity > capacity) {
-            grow(2);
+            growUntil(2, offset + data.capacity);
         }
 
         // Copy given buffer to GPU Buffer
@@ -1267,7 +1261,7 @@ struct MemPool {
         for (auto& buffer : buffers) {
             buffer.buffer = newBuffer.first;
         }
-        getBufferAddress();
+		getBufferAddress();
         // Internal handles were changed. We need descriptor updates
         descUpdateQueued.trigger();
     }
@@ -1305,10 +1299,12 @@ struct MemPool {
 
     void growUntil(int factor, VkDeviceSize finalSize) {
         auto oldCapacity = capacity;
-
-        capacity *= factor;
-        capacity = (capacity + alignment - 1) & ~(alignment - 1);
-
+        
+        while (capacity < finalSize) {
+            capacity *= factor;
+            capacity = (capacity + alignment - 1) & ~(alignment - 1);
+        }
+        
         // Notice how we don't grow the staging buffer. This can cause problems when trying to download the buffer to host, but eeh
         auto newBuffer = allocator->createBuffer(capacity,
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -1326,14 +1322,7 @@ struct MemPool {
             buffer.buffer = newBuffer.first;
         }
         getBufferAddress();
-
-        if (capacity >= finalSize) {
-            // Internal handles were changed. We need descriptor updates
-            descUpdateQueued.trigger();
-        }
-        else {
-            growUntil(factor, finalSize);
-        }
+        descUpdateQueued.trigger();
     }
 
     // ez operation.
@@ -1366,7 +1355,7 @@ struct MemPool {
         }
         auto& buf = buffers[index];
         auto alignedSize = buf.alignedSize(alignment);
-        auto elementSize = buf.numElements;
+		auto elementSize = buf.numElements;
         auto dataSize = buf.size();
         // Copy Data from GPU Buffer to Staging Buffer
         allocator->copyBuffer(buffer, stagingBuffer, dataSize, buf.offset, 0, true);
@@ -1384,7 +1373,7 @@ struct MemPool {
             // Update the offset of the remaining buffers
             for (size_t i = index; i < buffers.size(); ++i) {
                 buffers[i].offset -= alignedSize;
-                elementOffset -= elementSize;
+				elementOffset -= elementSize;
             }
 
             // internal offsets were changed. We need descriptor updates
@@ -1427,9 +1416,9 @@ struct MemPool {
         for (auto& buffer : buffers) {
             auto alignedSize = buffer.alignedSize(alignment);
             buffer.offset = runningOffset;
-            buffer.elementOffset = runningElementOffset;
+			buffer.elementOffset = runningElementOffset;
             runningOffset += alignedSize;
-            runningElementOffset += buffer.numElements;
+			runningElementOffset += buffer.numElements;
         }
 
         // need to notify all user resources to update their descriptor sets
@@ -1476,9 +1465,9 @@ struct MemPool {
 
         for (size_t i = index + 1; i < buffers.size(); ++i) {
             buffers[i].offset -= deadBufferSize; // decrement the offset of the remaining buffers by the dead buffer's size
-            buffers[i].elementOffset -= deadBufferElementSize;
+			buffers[i].elementOffset -= deadBufferElementSize;
             buffers[i].offset += alignedSize;    // increment the offset of the remaining buffers by the new buffer's size
-            buffers[i].elementOffset += static_cast<uint32_t>(data.size());
+			buffers[i].elementOffset += static_cast<uint32_t>(data.size());
             buffers[i].createDescriptors(static_cast<uint32_t>(i), flags); // assign correct binding
         }
 
@@ -1500,7 +1489,7 @@ struct MemPool {
 
         auto alignedOffset = buffers[index].offset;
         auto deadBufferSize = buffers[index].alignedSize(alignment);
-        auto deadBufferElementSize = buffers[index].numElements;
+		auto deadBufferElementSize = buffers[index].numElements;
         // decrement the offset by the buffer we're replacing
         offset -= deadBufferSize;
         occupied -= deadBufferSize;
@@ -1516,9 +1505,9 @@ struct MemPool {
 
         for (size_t i = index + 1; i < buffers.size(); ++i) {
             buffers[i].offset -= deadBufferSize; // decrement the offset of the remaining buffers by the dead buffer's size
-            buffers[i].elementOffset -= deadBufferElementSize;
+			buffers[i].elementOffset -= deadBufferElementSize;
             buffers[i].offset += alignedSize;    // increment the offset of the remaining buffers by the new buffer's size
-            buffers[i].elementOffset += static_cast<uint32_t>(data.size());
+			buffers[i].elementOffset += static_cast<uint32_t>(data.size());
             buffers[i].createDescriptors(static_cast<uint32_t>(i), flags); // assign correct binding
         }
 
@@ -1548,7 +1537,7 @@ struct MemPool {
         newBuffer.buffer = buffer;
         newBuffer.offset = buffers[index].offset;
         newBuffer.numElements = static_cast<uint32_t>(data.size());
-        newBuffer.elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
+		newBuffer.elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
         newBuffer.createDescriptors(index, flags);
         buffers.insert(buffers.begin() + index, newBuffer);
 
@@ -1557,7 +1546,7 @@ struct MemPool {
         occupied += alignedSize;
         for (size_t i = index + 1; i < buffers.size(); ++i) {
             buffers[i].offset += alignedSize;
-            buffers[i].elementOffset += static_cast<uint32_t>(data.size());
+			buffers[i].elementOffset += static_cast<uint32_t>(data.size());
             buffers[i].createDescriptors(static_cast<uint32_t>(i), flags); // assign correct binding
         }
 
@@ -1583,7 +1572,7 @@ struct MemPool {
         Buffer<T> newBuffer;
         newBuffer.buffer = buffer;
         newBuffer.offset = buffers[index].offset;
-        newBuffer.elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
+		newBuffer.elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
         newBuffer.numElements = static_cast<uint32_t>(data.capacity / sizeof(T));
         newBuffer.createDescriptors(index, flags);
         buffers.insert(buffers.begin() + index, newBuffer);
@@ -1593,7 +1582,7 @@ struct MemPool {
         occupied += alignedSize;
         for (size_t i = index + 1; i < buffers.size(); ++i) {
             buffers[i].offset += alignedSize;
-            buffers[i].elementOffset += static_cast<uint32_t>(data.size());
+			buffers[i].elementOffset += static_cast<uint32_t>(data.size());
             buffers[i].createDescriptors(static_cast<uint32_t>(i), flags); // assign correct binding
         }
         // internal offsets were changed. We need descriptor updates
@@ -1836,6 +1825,13 @@ struct Image2D {
         uploadTexture(path, allocator);
     }
 
+    ~Image2D() {
+        alloc->killMemory(stagingBuffer, stagingMemory);
+        alloc->killImage(image, memory);
+        alloc->init->disp.destroyImageView(imageView, nullptr);
+        alloc->init->disp.destroySampler(sampler, nullptr);
+    }
+
     Image2D() {};
 
     void createDescriptors(uint32_t bindingIdx, VkShaderStageFlags flags = VK_SHADER_STAGE_FRAGMENT_BIT, VkDescriptorType descType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
@@ -2038,51 +2034,54 @@ struct Image2D {
 };
 
 // uses bindless descriptors for Image2D access in shaders.
-// ONE PIPELINE CAN HAVE ONLY ONE IMAGE ARRAY! (for now)
 struct ImageArray {
-    std::vector<Image2D> images;
+    std::vector<std::shared_ptr<Image2D>> images;
 
-    VkDescriptorSet descSet;
-    VkDescriptorSetLayout descSetLayout;
-    VkDescriptorPool descPool;
+    VkDescriptorSet descSet = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool descPool = VK_NULL_HANDLE;
 
     uint32_t numImages = 100;
-
+    uint32_t bindingIndex = 0;
     Allocator* allocator;
 
     ImageArray(uint32_t numImages, Allocator* allocator) : numImages(numImages), allocator(allocator) {
-        if (numImages == 0) {
-            std::cerr << "numImages cannot be 0" << std::endl;
-            return;
-        }
-        createDescriptorPool();
-        createDescSetLayout();  // for now, the set = 1 is reserved for bindless textures via ImageArray
-        allocateDescSet();
-        allocator->init->addObject(this);
+		if (numImages == 0) {
+			std::cerr << "numImages cannot be 0" << std::endl;
+			return;
+		}
+		createDescriptorPool();
+		createDescSetLayout();  // for now, the set = 1 is reserved for bindless textures via ImageArray
+		allocateDescSet();
     };
-    ImageArray() {};
 
-    void destructor() {
-        allocator->init->disp.destroyDescriptorPool(descPool, nullptr);
-        allocator->init->disp.freeDescriptorSets(descPool, 1, &descSet);
-        allocator->init->disp.destroyDescriptorSetLayout(descSetLayout, nullptr);
+    // when the ImageArray is a member of a larger pool
+    ImageArray(uint32_t numImages, Allocator* allocator, uint32_t bindingIdx) : numImages(numImages), allocator(allocator), bindingIndex(bindingIdx) {}
+
+	ImageArray() {};
+
+    ~ImageArray() {
+		if (descPool != VK_NULL_HANDLE) {
+			allocator->init->disp.freeDescriptorSets(descPool, 1, &descSet);
+            allocator->init->disp.destroyDescriptorPool(descPool, nullptr);
+		}
+        if (descSetLayout != VK_NULL_HANDLE) {
+            allocator->init->disp.destroyDescriptorSetLayout(descSetLayout, nullptr);
+        }
     }
 
     // creates new image and pushes it back into the array and descriptor set
     void push_back(const std::string& path) {
-        images.emplace_back(path, allocator);
+        auto im = std::make_shared<Image2D>(path, allocator);
+        images.push_back(im);
     }
 
-    void erase(uint32_t index) {
-        if (index >= images.size()) {
-            throw std::out_of_range("Index out of range");
-        }
-        allocator->init->disp.destroyImageView(images[index].imageView, nullptr);
-        allocator->init->disp.destroySampler(images[index].sampler, nullptr);
-        allocator->init->disp.destroyImage(images[index].image, nullptr);
-        allocator->init->disp.freeMemory(images[index].memory, nullptr);
-        images.erase(images.begin() + index);
-    }
+	void erase(uint32_t index) {
+		if (index >= images.size()) {
+			throw std::out_of_range("Index out of range");
+		}
+		images.erase(images.begin() + index);
+	}
 
     void createDescriptorPool() {
         VkDescriptorPoolSize pool_sizes_bindless[] =
@@ -2096,7 +2095,7 @@ struct ImageArray {
         poolInfo.pPoolSizes = pool_sizes_bindless;
         poolInfo.maxSets = 1;
         poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
-        allocator->init->disp.createDescriptorPool(&poolInfo, nullptr, &descPool);
+		allocator->init->disp.createDescriptorPool(&poolInfo, nullptr, &descPool);
     }
 
     void createDescSetLayout() {
@@ -2143,9 +2142,114 @@ struct ImageArray {
     void updateDescriptorSets() {
         std::vector<VkWriteDescriptorSet> writes(images.size());
         for (size_t i = 0; i < images.size(); ++i) {
-            images[i].createDescriptors(0, VK_SHADER_STAGE_ALL);
-            images[i].updateDescriptorSet(descSet, i);
-            writes[i] = images[i].wrt_desc_set;
+            images[i]->createDescriptors(bindingIndex, VK_SHADER_STAGE_ALL);
+			images[i]->updateDescriptorSet(descSet, i);
+            writes[i] = images[i]->wrt_desc_set;
+        }
+		allocator->init->disp.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+};
+
+// for multiple image arrays in the same desc set
+struct ImagePool {
+    Allocator* allocator;
+    std::vector<std::unique_ptr<ImageArray>> arrays;
+
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+
+    uint32_t totalImages = 1000;
+
+    ImagePool(uint32_t numArrays = 10, uint32_t arraySizes = 100, Allocator* allocator = nullptr) : totalImages(numArrays* arraySizes), allocator(allocator) {
+        createDescriptorPool();
+    }
+
+    ~ImagePool() {
+		if (pool != VK_NULL_HANDLE) {
+			allocator->init->disp.freeDescriptorSets(pool, 1, &set);
+			allocator->init->disp.destroyDescriptorPool(pool, nullptr);
+		}
+		if (layout != VK_NULL_HANDLE) {
+			allocator->init->disp.destroyDescriptorSetLayout(layout, nullptr);
+		}
+    }
+
+    void addArray(std::unique_ptr<ImageArray>& array) {
+        array->descPool = pool;
+        array->descSetLayout = layout;
+        array->descSet = set;
+        arrays.push_back(std::move(array));
+    }
+
+    void createDescriptorPool() {
+        VkDescriptorPoolSize pool_sizes_bindless[] =
+        {
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, totalImages }
+        };
+
+        VkDescriptorPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = pool_sizes_bindless;
+        poolInfo.maxSets = 1;
+        poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        allocator->init->disp.createDescriptorPool(&poolInfo, nullptr, &pool);
+    }
+
+    void createDescSetLayout() {
+        std::vector<VkDescriptorBindingFlags> bindless_flags(arrays.size());
+
+        std::vector<VkDescriptorSetLayoutBinding> vk_bindings(arrays.size());
+        for (int i = 0; i < arrays.size(); i++) {
+            vk_bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            vk_bindings[i].descriptorCount = arrays[i]->numImages;
+            vk_bindings[i].binding = i;
+            vk_bindings[i].stageFlags = VK_SHADER_STAGE_ALL;
+            vk_bindings[i].pImmutableSamplers = nullptr;
+            bindless_flags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT;
+        }
+
+        VkDescriptorSetLayoutCreateInfo layout_info = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        layout_info.bindingCount = vk_bindings.size();
+        layout_info.pBindings = vk_bindings.data();
+        layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;
+
+        VkDescriptorSetLayoutBindingFlagsCreateInfoEXT extended_info{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT, nullptr };
+        extended_info.bindingCount = vk_bindings.size();
+        extended_info.pBindingFlags = bindless_flags.data();
+
+        layout_info.pNext = &extended_info;
+
+        allocator->init->disp.createDescriptorSetLayout(&layout_info, nullptr, &layout);
+    }
+
+    void allocateDescSet() {
+        VkDescriptorSetAllocateInfo alloc_info{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        alloc_info.descriptorPool = pool;
+        alloc_info.descriptorSetCount = 1;
+        alloc_info.pSetLayouts = &layout;
+
+        VkDescriptorSetVariableDescriptorCountAllocateInfoEXT count_info{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO_EXT };
+        uint32_t max_binding = totalImages - 1;
+        count_info.descriptorSetCount = 1;
+        // This number is the max allocatable count
+        count_info.pDescriptorCounts = &max_binding;
+        alloc_info.pNext = &count_info;
+
+        allocator->init->disp.allocateDescriptorSets(&alloc_info, &set);
+    }
+
+    void updateDescriptorSets() {
+        std::vector<VkWriteDescriptorSet> writes;
+
+        for (int j = 0; j < arrays.size(); j++) {
+            for (int i = 0; i < arrays[j]->images.size(); i++) {
+                arrays[j]->bindingIndex = j;
+                arrays[j]->images[i]->createDescriptors(j, VK_SHADER_STAGE_ALL);
+                arrays[j]->images[i]->updateDescriptorSet(set, i);
+                writes.push_back(arrays[j]->images[i]->wrt_desc_set);
+            }
         }
         allocator->init->disp.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -2308,33 +2412,6 @@ struct Swapchain {
         swapchain = swap_ret.value();
     }
 };
-
-#pragma once  
-#define GLM_FORCE_RADIANS  
-#define GLM_FORCE_DEPTH_ZERO_TO_ONE
-#define GLM_ENABLE_EXPERIMENTAL
-#define GLFW_INCLUDE_VULKAN
-#define TINYOBJLOADER_IMPLEMENTATION
-constexpr int MAX_FRAMES_IN_FLIGHT = 3;
-
-#include <glm/glm.hpp>  
-#include <glm/gtc/matrix_transform.hpp>  
-#include <glm/gtc/type_ptr.hpp>  
-#include <glm/gtx/hash.hpp>
-#include <glm/gtx/quaternion.hpp>
-#include <glm/gtx/string_cast.hpp>
-#include <vulkan/vulkan_core.h>
-#include <GLFW/glfw3.h>  
-#include "VkBootstrap.h"  
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <fstream>
-#include <unordered_map>
-#include "VkMemAlloc.hpp"
-#include "RendererBuilder.hpp"
-#include "registry.hpp"
-#include "tiny_obj_loader.h"
 
 int calcium_device_initialization(Init* init, GLFWwindow* window, VkSurfaceKHR surface) {
     vkb::InstanceBuilder instance_builder;
@@ -2714,6 +2791,14 @@ struct RenderSubpass {
     }
 };
 
+struct UniformBuf {
+    VkDeviceAddress lights;
+    VkDeviceAddress positions;
+    VkDeviceAddress normals;
+    VkDeviceAddress uvs;
+    VkDeviceAddress indices;
+};
+
 struct Pipeline {
     VkRenderPass renderPass;
     RenderSubpass subpass;
@@ -2725,14 +2810,18 @@ struct Pipeline {
     VkDescriptorPool descriptorPool;
 
     std::vector<VkPushConstantRange> pushConsts;
+    std::unique_ptr<UniformBuffer<UniformBuf>> uniformBuf;
     std::vector<std::unique_ptr<Image2D>> images;
-    std::vector<ImageArray> imageArrays;
+    std::vector<std::unique_ptr<ImageArray>> imageArrays;
+    std::vector<std::unique_ptr<ImagePool>> imagePool;
     std::vector<VkDescriptorSetLayout> descriptorSetLayouts;
 
-    Framebuffer framebuffer;
+    std::unique_ptr<Framebuffer> framebuffer;
 
     Swapchain* swapchain;
     Allocator* allocator;
+
+    std::unique_ptr<Pipeline> pPreviousPipeline;
 
     std::vector<VkShaderModule> shaders;
     std::vector<VkPipelineShaderStageCreateInfo> shader_stages;
@@ -2740,21 +2829,43 @@ struct Pipeline {
     std::function<void()> createPipelineFunction;
 
     Pipeline(Swapchain* swapchain, Allocator* allocator, int width, int height) : swapchain(swapchain), allocator(allocator) {
-        framebuffer = Framebuffer(width, height, 1, MAX_FRAMES_IN_FLIGHT, renderPass, allocator);
+        framebuffer = std::make_unique<Framebuffer>(width, height, 1, MAX_FRAMES_IN_FLIGHT, renderPass, allocator);
     }
 
     Pipeline(Swapchain* swapchain, Allocator* allocator) : swapchain(swapchain), allocator(allocator) {
-        framebuffer = Framebuffer(swapchain->width, swapchain->height, 1, MAX_FRAMES_IN_FLIGHT, renderPass, allocator);
+        framebuffer = std::make_unique<Framebuffer>(swapchain->width, swapchain->height, 1, MAX_FRAMES_IN_FLIGHT, renderPass, allocator);
     }
 
     Pipeline() {};
 
+    ~Pipeline() {
+        if (renderPass != VK_NULL_HANDLE) {
+            allocator->init->disp.destroyRenderPass(renderPass, nullptr);
+        }
+        if (pipeline != VK_NULL_HANDLE) {
+            allocator->init->disp.destroyPipeline(pipeline, nullptr);
+        }
+        if (layout != VK_NULL_HANDLE) {
+            allocator->init->disp.destroyPipelineLayout(layout, nullptr);
+        }
+        if (descriptorSetLayout != VK_NULL_HANDLE) {
+            allocator->init->disp.destroyDescriptorSetLayout(descriptorSetLayout, nullptr);
+        }
+        if (descriptorPool != VK_NULL_HANDLE) {
+            allocator->init->disp.destroyDescriptorPool(descriptorPool, nullptr);
+        }
+
+        images.clear();
+		imageArrays.clear();
+		imagePool.clear();
+    }
+
     virtual void initialize() {
 
-        if (framebuffer.attachments[0].attachments.size() > 0) {
+        if (framebuffer->attachments[0].attachments.size() > 0) {
             createRenderPassFB();
-            framebuffer.renderPass = renderPass;
-            framebuffer.init();
+            framebuffer->renderPass = renderPass;
+            framebuffer->init();
         }
         else {
             createRenderPassNoFB();
@@ -2774,9 +2885,9 @@ struct Pipeline {
     }
 
     void addImageArray(uint32_t maxImages) {
-        ImageArray imageArray = ImageArray(maxImages, allocator);
-        imageArray.updateDescriptorSets();
-        imageArrays.push_back(imageArray);
+        std::unique_ptr<ImageArray> imageArray = std::make_unique<ImageArray>(maxImages, allocator);
+        imageArray->updateDescriptorSets();
+        imageArrays.push_back(std::move(imageArray));
     }
 
     void addPushConstant(VkDeviceSize range, VkDeviceSize offset, VkShaderStageFlags stage) {
@@ -2790,12 +2901,12 @@ struct Pipeline {
 
     void addColorAttachment(std::shared_ptr<FBAttachment>& attachment) {
         subpass.addColorAttachment(attachment.get());
-        framebuffer.addAttachment(attachment);
+        framebuffer->addAttachment(attachment);
     }
 
     void setDepthAttachment(std::shared_ptr<FBAttachment>& attachment) {
         subpass.addDepthStencilAttachment(attachment.get());
-        framebuffer.addAttachment(attachment);
+        framebuffer->addAttachment(attachment);
     }
 
     void createDescriptorPool() {
@@ -2838,8 +2949,12 @@ struct Pipeline {
         }
 
         allocator->init->disp.updateDescriptorSets(images.size(), writeSets.data(), 0, nullptr);
-        for (auto& imageArray : imageArrays) {
-            imageArray.updateDescriptorSets();
+		for (auto& imageArray : imageArrays) {
+			imageArray->updateDescriptorSets();
+		}
+
+        for (auto& pool : imagePool) {
+            pool->updateDescriptorSets();
         }
     }
 
@@ -2849,9 +2964,15 @@ struct Pipeline {
         images.push_back(std::move(image));
     }
 
+    void addImagePool(std::unique_ptr<ImagePool>& pool) {
+        pool->createDescSetLayout();
+        pool->allocateDescSet();
+        imagePool.push_back(std::move(pool));
+    }
+
     // if there is custom framebuffer, that means it'll output to that framebuffer, which is handled by the pipeline object itself
     virtual void createRenderPassFB() {
-        std::vector<VkAttachmentDescription> attachments = framebuffer.getAttachmentDescriptions();
+        std::vector<VkAttachmentDescription> attachments = framebuffer->getAttachmentDescriptions();
 
         VkRenderPassCreateInfo render_pass_info = {};
         render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -2862,7 +2983,7 @@ struct Pipeline {
         render_pass_info.dependencyCount = 1;
         render_pass_info.pDependencies = &subpass.subpassDependency;
         render_pass_info.flags = 0;
-        render_pass_info.pNext = nullptr;
+		render_pass_info.pNext = nullptr;
 
         if (allocator->init->disp.createRenderPass(&render_pass_info, nullptr, &renderPass) != VK_SUCCESS) {
             std::cout << "failed to create render pass\n";
@@ -2917,26 +3038,43 @@ struct Pipeline {
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 
-        if (images.size() > 0 && imageArrays.size() > 0) {
-            descriptorSetLayouts.resize(imageArrays.size() + 1);
+        if (images.size() > 0 && imageArrays.size() > 0 && imagePool.size() > 0) {
+            descriptorSetLayouts.resize(imageArrays.size() + 1  + imagePool.size());
             descriptorSetLayouts[0] = descriptorSetLayout;
             for (size_t i = 0; i < imageArrays.size(); ++i) {
-                descriptorSetLayouts[i + 1] = imageArrays[i].descSetLayout;
+                descriptorSetLayouts[i + 1] = imageArrays[i]->descSetLayout;
+            }
+            for (size_t i = 0; i < imagePool.size(); i++) {
+                descriptorSetLayouts[1 + imageArrays.size() + i] = imagePool[i]->layout;
             }
             pipelineLayoutInfo.setLayoutCount = static_cast<uint32_t>(descriptorSetLayouts.size());
             pipelineLayoutInfo.pSetLayouts = descriptorSetLayouts.data();
         }
-        else if (images.size() == 0 && imageArrays.size() > 0) {
-            descriptorSetLayouts.resize(imageArrays.size());
+        else if (images.size() == 0 && imageArrays.size() > 0 && imagePool.size() > 0) {
+            descriptorSetLayouts.resize(imageArrays.size() + imagePool.size());
             for (size_t i = 0; i < imageArrays.size(); ++i) {
-                descriptorSetLayouts[i] = imageArrays[i].descSetLayout;
+                descriptorSetLayouts[i] = imageArrays[i]->descSetLayout;
+            }
+            for (size_t i = 0; i < imagePool.size(); i++) {
+                descriptorSetLayouts[imageArrays.size() + i] = imagePool[i]->layout;
             }
             pipelineLayoutInfo.setLayoutCount = static_cast<uint32_t>(descriptorSetLayouts.size());
             pipelineLayoutInfo.pSetLayouts = descriptorSetLayouts.data();
         }
-        else if (images.size() > 0 && imageArrays.size() == 0) {
-            pipelineLayoutInfo.setLayoutCount = 1;
-            pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
+        else if (images.size() > 0 && imageArrays.size() == 0 && imagePool.size() > 0) {
+            descriptorSetLayouts.resize(imagePool.size() + 1);
+            descriptorSetLayouts[0] = descriptorSetLayout;
+            for (size_t i = 0; i < imagePool.size(); i++) {
+                descriptorSetLayouts[1 + i] = imagePool[i]->layout;
+            }
+            pipelineLayoutInfo.setLayoutCount = descriptorSetLayouts.size();
+            pipelineLayoutInfo.pSetLayouts = descriptorSetLayouts.data();
+        }
+        else if (images.size() == 0 && imageArrays.size() == 0 && imagePool.size() > 0) {
+            descriptorSetLayouts.resize(imagePool.size());
+            for (size_t i = 0; i < imagePool.size(); i++) {
+                descriptorSetLayouts[i] = imagePool[i]->layout;
+            }
         }
         else {
             pipelineLayoutInfo.setLayoutCount = 0;
@@ -2991,15 +3129,32 @@ struct Pipeline {
     }
 
     void bindDescSets(VkCommandBuffer& cmd) const {
-        if (images.size() > 0) {
+        if (images.size() > 0 && imageArrays.size() > 0) {
             allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &descriptorSet, 0, nullptr);
             for (int i = 0; i < imageArrays.size(); i++) {
-                allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, i + 1, 1, &imageArrays[i].descSet, 0, nullptr);
+                allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, i + 1, 1, &imageArrays[i]->descSet, 0, nullptr);
+            }
+            for (int i = 0; i < imagePool.size(); i++) {
+                allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, i + 2, 1, &imagePool[i]->set, 0, nullptr);
             }
         }
         else if (images.size() == 0 && imageArrays.size() > 0) {
             for (int i = 0; i < imageArrays.size(); i++) {
-                allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, i, 1, &imageArrays[i].descSet, 0, nullptr);
+                allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, i, 1, &imageArrays[i]->descSet, 0, nullptr);
+            }
+            for (int i = 0; i < imagePool.size(); i++) {
+                allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, i + 1, 1, &imagePool[i]->set, 0, nullptr);
+            }
+        }
+        else if (images.size() == 0 && imageArrays.size() == 0 && imagePool.size() > 0) {
+            for (int i = 0; i < imagePool.size(); i++) {
+                allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, i, 1, &imagePool[i]->set, 0, nullptr);
+            }
+        }
+        else if (images.size() > 0 && imageArrays.size() == 0 && imagePool.size() > 0) {
+            allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &descriptorSet, 0, nullptr);
+            for (int i = 0; i < imagePool.size(); i++) {
+                allocator->init->disp.cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, i + 1, 1, &imagePool[i]->set, 0, nullptr);
             }
         }
     }
@@ -3009,7 +3164,7 @@ struct Pipeline {
         VkRenderPassBeginInfo info = {};
         info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         info.renderPass = renderPass;
-        info.framebuffer = framebuffer.framebuffers[frameIndex];
+        info.framebuffer = framebuffer->framebuffers[frameIndex];
         info.renderArea.offset = { 0, 0 };
         info.renderArea.extent = swapchain->swapchain.extent;
         info.clearValueCount = 1;
@@ -3022,9 +3177,9 @@ struct Pipeline {
         allocator->init->disp.cmdEndRenderPass(cmd);
     }
 
-    void render(VkCommandBuffer& cmd, VkCommandBuffer& renderCmds, VkRenderPassBeginInfo& info) {
+    void render(VkCommandBuffer& cmd, VkCommandBuffer& renderCmds, VkRenderPassBeginInfo& info) const {
         allocator->init->disp.cmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        if (images.size() > 0 || imageArrays.size() > 0) { bindDescSets(cmd); }
+        if (images.size() > 0 || imageArrays.size() > 0 || imagePool.size() > 0) { bindDescSets(cmd); }
         allocator->init->disp.cmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
         allocator->init->disp.cmdExecuteCommands(cmd, 1, &renderCmds);
         allocator->init->disp.cmdEndRenderPass(cmd);
@@ -3033,14 +3188,14 @@ struct Pipeline {
 
 struct DepthPipeline : public Pipeline {
 
-    DepthPipeline() : Pipeline() {};
+	DepthPipeline() : Pipeline() {};
 
     DepthPipeline(Swapchain* swapchain, Allocator* allocator) : Pipeline(swapchain, allocator) {};
 
     DepthPipeline(const std::string& vertexPath, const std::string& fragmentPath, Swapchain* swapchain, Allocator* allocator) : Pipeline(swapchain, allocator) {
-        addShaderModule(vertexPath, VK_SHADER_STAGE_VERTEX_BIT);
-        addShaderModule(fragmentPath, VK_SHADER_STAGE_FRAGMENT_BIT);
-        addPushConstant(sizeof(DepthPushConst), 0, VK_SHADER_STAGE_VERTEX_BIT);
+		addShaderModule(vertexPath, VK_SHADER_STAGE_VERTEX_BIT);
+		addShaderModule(fragmentPath, VK_SHADER_STAGE_FRAGMENT_BIT);
+		addPushConstant(sizeof(DepthPushConst), 0, VK_SHADER_STAGE_VERTEX_BIT);
 
         subpass = RenderSubpass(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, nullptr);
 
@@ -3050,12 +3205,12 @@ struct DepthPipeline : public Pipeline {
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, allocator);
 
-        setDepthAttachment(depthAttachment);
+		setDepthAttachment(depthAttachment);
 
         initialize();
 
-        //allocator->init->addObject(this);
-    }
+		//allocator->init->addObject(this);
+	}
 
     void createPipeline() override {
 
@@ -3159,17 +3314,17 @@ struct DepthPipeline : public Pipeline {
         pipeline_info.pMultisampleState = &multisampling;
         pipeline_info.pColorBlendState = &color_blending;
         pipeline_info.pDynamicState = &dynamic_info;
-        pipeline_info.pDepthStencilState = &depthStencil;
+		pipeline_info.pDepthStencilState = &depthStencil;
         pipeline_info.layout = layout;
         pipeline_info.renderPass = renderPass;
         pipeline_info.subpass = 0;
         pipeline_info.basePipelineHandle = VK_NULL_HANDLE;
 
-        if (allocator->init->disp.createGraphicsPipelines(VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
-            throw std::exception("failed to create graphics pipeline");
-        }
+		if (allocator->init->disp.createGraphicsPipelines(VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
+			throw std::exception("failed to create graphics pipeline");
+		}
 
-        for (auto& shader : shaders) {
+        for (auto & shader : shaders) {
             allocator->init->disp.destroyShaderModule(shader, nullptr);
         }
     }
@@ -3177,48 +3332,51 @@ struct DepthPipeline : public Pipeline {
 
 struct GraphicsPipeline : public Pipeline {
 
-    Init* init;
-    int width, height;
-
-    std::vector<std::unique_ptr<Pipeline>> pipelines;
-
-    GraphicsPipeline(const std::string& vertexPath, const std::string& fragmentPath, Init* init, Swapchain* swapchain, Allocator* allocator, int width, int height) : width(width), height(height), init(init), Pipeline(swapchain, allocator) {
+    GraphicsPipeline(const std::string& vertexPath, const std::string& fragmentPath, Swapchain* swapchain, Allocator* allocator) :Pipeline(swapchain, allocator) {
 
         addShaderModule(vertexPath, VK_SHADER_STAGE_VERTEX_BIT);
         addShaderModule(fragmentPath, VK_SHADER_STAGE_FRAGMENT_BIT);
         addPushConstant(sizeof(PushConst), 0, VK_SHADER_STAGE_VERTEX_BIT);
 
         std::unique_ptr<Pipeline> depthPipeline = std::make_unique<DepthPipeline>("depth.vert.spv", "depth.frag.spv", swapchain, allocator);
-        addPipeline(depthPipeline);
+        pPreviousPipeline = std::move(depthPipeline);
 
-        addImage(pipelines[0]->framebuffer.attachments[0].attachments[0]->image); // add depth image to this pipeline (in this case, it's set = 0, binding = 0)
-        addImage(pipelines[0]->framebuffer.attachments[1].attachments[0]->image); // add depth image number 2 to this pipeline (in this case, it's set = 0, binding = 1)
-        addImage(pipelines[0]->framebuffer.attachments[2].attachments[0]->image); // add depth image number 3 to this pipeline (in this case, it's set = 0, binding = 2)
-        addImageArray(100);
+		addImage(pPreviousPipeline->framebuffer->attachments[0].attachments[0]->image); // add depth image to this pipeline (in this case, it's set = 0, binding = 0)
+		addImage(pPreviousPipeline->framebuffer->attachments[1].attachments[0]->image); // add depth image number 2 to this pipeline (in this case, it's set = 0, binding = 1)
+		addImage(pPreviousPipeline->framebuffer->attachments[2].attachments[0]->image); // add depth image number 3 to this pipeline (in this case, it's set = 0, binding = 2)
+        
+        std::unique_ptr<ImagePool> images = std::make_unique<ImagePool>(4, 100, allocator);
+        std::unique_ptr<ImageArray> albedo = std::make_unique<ImageArray>(100, allocator, 0);
+        std::unique_ptr<ImageArray> roughness = std::make_unique<ImageArray>(100, allocator, 1);
+        std::unique_ptr<ImageArray> ao = std::make_unique<ImageArray>(100, allocator, 2);
+        std::unique_ptr<ImageArray> metallic = std::make_unique<ImageArray>(100, allocator, 3);
+
+        images->addArray(albedo);
+        images->addArray(roughness);
+        images->addArray(ao);
+        images->addArray(metallic);
+
+        addImagePool(images);
+
         initialize();
 
         //init->addObject(this);
     }
 
-    GraphicsPipeline(Init* init, Swapchain* swapchain, Allocator* allocator) : init(init), Pipeline(swapchain, allocator) {}
+    GraphicsPipeline(Init* init, Swapchain* swapchain, Allocator* allocator) : Pipeline(swapchain, allocator) {}
 
     GraphicsPipeline() {};
 
-    // assumes that the pipeline is already initialized
-    void addPipeline(std::unique_ptr<Pipeline>& pipeline) {
-        pipelines.push_back(std::move(pipeline));
-    }
+	void createPipeline() override {
+		VkGraphicsPipelineCreateInfo pipelineInfo = {};
+		pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+		pipelineInfo.stageCount = shaders.size();
 
-    void createPipeline() override {
-        VkGraphicsPipelineCreateInfo pipelineInfo = {};
-        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pipelineInfo.stageCount = shaders.size();
-
-        std::vector<VkPipelineShaderStageCreateInfo> shaderStages(shaders.size());
-        for (size_t i = 0; i < shaders.size(); ++i) {
-            shaderStages[i] = shader_stages[i];
-        }
-        pipelineInfo.pStages = shaderStages.data();
+		std::vector<VkPipelineShaderStageCreateInfo> shaderStages(shaders.size());
+		for (size_t i = 0; i < shaders.size(); ++i) {
+			shaderStages[i] = shader_stages[i];
+		}
+		pipelineInfo.pStages = shaderStages.data();
 
         // No vertex input state needed
         VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
@@ -3229,14 +3387,14 @@ struct GraphicsPipeline : public Pipeline {
         vertexInputInfo.pVertexAttributeDescriptions = nullptr; // No attribute descriptions
 
         pipelineInfo.pVertexInputState = &vertexInputInfo;
-
-        // Input Assembly
-        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
-        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        inputAssembly.primitiveRestartEnable = VK_FALSE;
-        pipelineInfo.pInputAssemblyState = &inputAssembly;
-
+        
+		// Input Assembly
+		VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+		inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		inputAssembly.primitiveRestartEnable = VK_FALSE;
+		pipelineInfo.pInputAssemblyState = &inputAssembly;
+		
         VkViewport viewport = {};
         viewport.x = 0.0f;
         viewport.y = 0.0f;
@@ -3310,14 +3468,14 @@ struct GraphicsPipeline : public Pipeline {
         pipeline_info.subpass = 0;
         pipeline_info.basePipelineHandle = VK_NULL_HANDLE;
 
-        if (init->disp.createGraphicsPipelines(VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
+        if (allocator->init->disp.createGraphicsPipelines(VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
             std::cout << "failed to create pipline\n";
         }
 
         for (auto& shader : shaders) {
-            init->disp.destroyShaderModule(shader, nullptr);
+            allocator->init->disp.destroyShaderModule(shader, nullptr);
         }
-    }
+	}
 };
 
 struct Material {
@@ -3705,8 +3863,8 @@ struct Scene {
 };
 
 struct Engine {
-
-    Init init;
+     
+    Init init;  
 
     GLFWwindow* window;
 
@@ -3718,7 +3876,7 @@ struct Engine {
     VkQueue presentQueue;
 
     Swapchain swapchain;
-    GraphicsPipeline pipeline;
+    GraphicsPipeline* pipeline;
 
     std::vector<VkImage> swapchainImages;
     std::vector<VkImageView> swapchainImageViews;
@@ -3726,8 +3884,8 @@ struct Engine {
 
     VkCommandPool commandPool;
     std::vector<VkCommandBuffer> commandBuffers;
-    std::vector<VkCommandBuffer> secondaryCmdBufs;
-    std::vector<VkCommandBuffer> secondaryCmdBufsDepth;
+	std::vector<VkCommandBuffer> secondaryCmdBufs;
+	std::vector<VkCommandBuffer> secondaryCmdBufsDepth;
 
     std::vector<VkSemaphore> availiables;
     std::vector<VkSemaphore> finishes;
@@ -3740,13 +3898,13 @@ struct Engine {
 
     static Scene scene;
 
-    Engine(int width, int height, const std::string& vertexPath, const std::string& fragmentPath) : height(height), width(width) {
+    Engine(int width, int height, const std::string& vertexPath, const std::string& fragmentPath) : height(height), width(width) {  
         glfwInit();
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-        window = glfwCreateWindow(width, height, "Calcium", nullptr, nullptr);
-        if (!window) {
-            throw std::runtime_error("failed to create window");
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);  
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);  
+        window = glfwCreateWindow(width, height, "Calcium", nullptr, nullptr);  
+        if (!window) {  
+            throw std::runtime_error("failed to create window");  
         }
 
         glfwSetCursorPosCallback(window, mouse_callback);
@@ -3756,28 +3914,28 @@ struct Engine {
         calcium_device_initialization(&init, window, surface);
 
         allocator = new Allocator(&init);
-
+        
         createSwapchain();
         get_queues();
         createCommandPool();
-
-        allocator->graphicsPool = commandPool;
+        
+		allocator->graphicsPool = commandPool;
         allocator->graphicsQueue = graphicsQueue;
 
         createGraphicsPipeline(vertexPath, fragmentPath);
-
-        scene = Scene(allocator, &pipeline);
-
+        
+        scene = Scene(allocator, pipeline);
+        
         auto entity = new Entity(glm::vec3(1.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(1.0f), true);
-        entity->mesh.loadModel("cube.obj");
-        entity->mesh.material.loadTexture("test.jpg");
-
-        auto entity2 = new Entity(glm::vec3(0.0f, -1.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(10.0f, 10.0f, 10.0f), true);
-        entity2->mesh.loadModel("bunny.obj");
-        entity2->mesh.material.loadTexture("bricks.jpg");
-
+		entity->mesh.loadModel("cube.obj");
+		entity->mesh.material.loadTexture("test.jpg");
+        
+		auto entity2 = new Entity(glm::vec3(0.0f, -1.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(10.0f, 10.0f, 10.0f), true);
+		entity2->mesh.loadModel("bunny.obj");
+		entity2->mesh.material.loadTexture("bricks.jpg");
+		
         scene.addEntity(*entity);
-        scene.addEntity(*entity2);
+		scene.addEntity(*entity2);
 
         createFramebuffers();
         createCommandBuffers();
@@ -3785,8 +3943,8 @@ struct Engine {
     };
 
     ~Engine() {
-        init.destroy();
-        delete allocator;
+        delete pipeline;
+
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             init.disp.destroySemaphore(finishes[i], nullptr);
             init.disp.destroySemaphore(availiables[i], nullptr);
@@ -3799,12 +3957,8 @@ struct Engine {
             init.disp.destroyFramebuffer(framebuffer, nullptr);
         }
 
-        init.disp.destroyPipeline(pipeline.pipeline, nullptr);
-        init.disp.destroyPipelineLayout(pipeline.layout, nullptr);
-        init.disp.destroyRenderPass(pipeline.renderPass, nullptr);
-
         swapchain.swapchain.destroy_image_views(swapchainImageViews);
-
+        delete allocator;
         vkb::destroy_swapchain(swapchain.swapchain);
         vkb::destroy_device(init.device);
         vkb::destroy_instance(init.instance);
@@ -3831,7 +3985,7 @@ struct Engine {
     }
 
     void createGraphicsPipeline(const std::string& vertexPath, const std::string& fragmentPath) {
-        pipeline = GraphicsPipeline(vertexPath, fragmentPath, &init, &swapchain, allocator, width, height);
+        pipeline = new GraphicsPipeline(vertexPath, fragmentPath, &swapchain, allocator);
     }
 
     void createFramebuffers() {
@@ -3845,10 +3999,10 @@ struct Engine {
 
             VkFramebufferCreateInfo framebuffer_info = {};
             framebuffer_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-            framebuffer_info.renderPass = pipeline.renderPass;
+            framebuffer_info.renderPass = pipeline->renderPass;
             framebuffer_info.attachmentCount = 1;
             framebuffer_info.pAttachments = attachments;
-            framebuffer_info.width = swapchain.swapchain.extent.width;
+            framebuffer_info.width =  swapchain.swapchain.extent.width;
             framebuffer_info.height = swapchain.swapchain.extent.height;
             framebuffer_info.layers = 1;
 
@@ -3863,7 +4017,7 @@ struct Engine {
         VkCommandPoolCreateInfo pool_info = {};
         pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         pool_info.queueFamilyIndex = init.device.get_queue_index(vkb::QueueType::graphics).value();
-        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+		pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
         if (init.disp.createCommandPool(&pool_info, nullptr, &commandPool) != VK_SUCCESS) {
             std::cout << "failed to create command pool\n";
@@ -3884,25 +4038,25 @@ struct Engine {
             throw std::exception("couldn't allocate cmd bufs");
         }
         secondaryCmdBufs.resize(framebuffers.size());
-        VkCommandBufferAllocateInfo allocInfo2 = {};
-        allocInfo2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo2.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
-        allocInfo2.commandPool = commandPool;
-        allocInfo2.commandBufferCount = (uint32_t)secondaryCmdBufs.size();
+		VkCommandBufferAllocateInfo allocInfo2 = {};
+		allocInfo2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo2.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+		allocInfo2.commandPool = commandPool;
+		allocInfo2.commandBufferCount = (uint32_t)secondaryCmdBufs.size();
 
         if (init.disp.allocateCommandBuffers(&allocInfo2, secondaryCmdBufs.data()) != VK_SUCCESS) {
             throw std::exception("couldn't allocate secondary cmd bufs");
         }
 
-        secondaryCmdBufsDepth.resize(framebuffers.size());
-        VkCommandBufferAllocateInfo allocInfo3 = {};
-        allocInfo3.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo3.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
-        allocInfo3.commandPool = commandPool;
-        allocInfo3.commandBufferCount = (uint32_t)secondaryCmdBufsDepth.size();
-        if (init.disp.allocateCommandBuffers(&allocInfo3, secondaryCmdBufsDepth.data()) != VK_SUCCESS) {
-            throw std::exception("couldn't allocate secondary cmd bufs");
-        }
+		secondaryCmdBufsDepth.resize(framebuffers.size());
+		VkCommandBufferAllocateInfo allocInfo3 = {};
+		allocInfo3.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo3.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+		allocInfo3.commandPool = commandPool;
+		allocInfo3.commandBufferCount = (uint32_t)secondaryCmdBufsDepth.size();
+		if (init.disp.allocateCommandBuffers(&allocInfo3, secondaryCmdBufsDepth.data()) != VK_SUCCESS) {
+			throw std::exception("couldn't allocate secondary cmd bufs");
+		}
 
         recordPrimaryCmds();
     }
@@ -3915,8 +4069,8 @@ struct Engine {
             if (init.disp.beginCommandBuffer(commandBuffers[i], &begin_info) != VK_SUCCESS) {
                 throw std::exception("can't begin command buffer recording");
             }
-
-            // viewport and scissor
+            
+			// viewport and scissor
             VkViewport viewport = {};
             viewport.x = 0.0f;
             viewport.y = 0.0f;
@@ -3934,9 +4088,9 @@ struct Engine {
 
             // bind the depth pipeline first
             VkClearValue clearDepth{ { { 0.0f, 0 } } };
-            pipeline.pipelines[0]->render(commandBuffers[i], secondaryCmdBufsDepth[i], clearDepth, i);
-
-            // now bind the main pipeline
+            pipeline->pPreviousPipeline->render(commandBuffers[i], secondaryCmdBufsDepth[i], clearDepth, i);
+            
+			// now bind the main pipeline
             VkRenderPassBeginInfo info = {};
             info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
             info.framebuffer = framebuffers[i];
@@ -3945,9 +4099,9 @@ struct Engine {
             info.pClearValues = &clearColor;
             info.renderArea.offset = { 0, 0 };
             info.renderArea.extent = swapchain.swapchain.extent;
-            info.renderPass = pipeline.renderPass;
+            info.renderPass = pipeline->renderPass;
 
-            pipeline.render(commandBuffers[i], secondaryCmdBufs[i], info);
+            pipeline->render(commandBuffers[i], secondaryCmdBufs[i], info);
 
             if (init.disp.endCommandBuffer(commandBuffers[i]) != VK_SUCCESS) {
                 throw std::exception("couldn't end cmd buf");
@@ -4013,41 +4167,41 @@ struct Engine {
         submitInfo.pSignalSemaphores = signal_semaphores;
 
         init.disp.resetFences(1, &inFlights[currentFrame]);
-
+        
         // Ensure secondary command buffers are reset before re-recording  
-        init.disp.resetCommandBuffer(secondaryCmdBufsDepth[image_index], 0);
-        init.disp.resetCommandBuffer(secondaryCmdBufs[image_index], 0);
+        init.disp.resetCommandBuffer(secondaryCmdBufsDepth[image_index], 0);  
+        init.disp.resetCommandBuffer(secondaryCmdBufs[image_index], 0);  
 
         // Update secondary command buffers every frame for depth render pass  
-        VkCommandBufferInheritanceInfo inheritanceInfoDepth = {};
-        inheritanceInfoDepth.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
-        inheritanceInfoDepth.renderPass = pipeline.pipelines[0]->renderPass;
-        inheritanceInfoDepth.framebuffer = pipeline.pipelines[0]->framebuffer.framebuffers[image_index];
-        inheritanceInfoDepth.pNext = nullptr;
+        VkCommandBufferInheritanceInfo inheritanceInfoDepth = {};  
+        inheritanceInfoDepth.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;  
+        inheritanceInfoDepth.renderPass = pipeline->pPreviousPipeline->renderPass;  
+        inheritanceInfoDepth.framebuffer = pipeline->pPreviousPipeline->framebuffer->framebuffers[image_index];  
+        inheritanceInfoDepth.pNext = nullptr;  
 
-        VkCommandBufferBeginInfo beginInfoDepth = {};
-        beginInfoDepth.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfoDepth.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
-        beginInfoDepth.pInheritanceInfo = &inheritanceInfoDepth;
+        VkCommandBufferBeginInfo beginInfoDepth = {};  
+        beginInfoDepth.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;  
+        beginInfoDepth.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;  
+        beginInfoDepth.pInheritanceInfo = &inheritanceInfoDepth;  
 
         // Issue draw calls  
-        init.disp.beginCommandBuffer(secondaryCmdBufsDepth[image_index], &beginInfoDepth);
-        scene.renderSceneDepth(secondaryCmdBufsDepth[image_index], width, height);
-        init.disp.endCommandBuffer(secondaryCmdBufsDepth[image_index]);
+        init.disp.beginCommandBuffer(secondaryCmdBufsDepth[image_index], &beginInfoDepth);  
+        scene.renderSceneDepth(secondaryCmdBufsDepth[image_index], width, height);  
+        init.disp.endCommandBuffer(secondaryCmdBufsDepth[image_index]);  
 
         // Update secondary command buffers every frame for main render pass  
-        VkCommandBufferInheritanceInfo inheritanceInfo = {};
-        inheritanceInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
-        inheritanceInfo.renderPass = pipeline.renderPass;
-        inheritanceInfo.framebuffer = framebuffers[image_index];
+        VkCommandBufferInheritanceInfo inheritanceInfo = {};  
+        inheritanceInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;  
+        inheritanceInfo.renderPass = pipeline->renderPass;  
+        inheritanceInfo.framebuffer = framebuffers[image_index];  
 
-        VkCommandBufferBeginInfo beginInfo = {};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
-        beginInfo.pInheritanceInfo = &inheritanceInfo;
+        VkCommandBufferBeginInfo beginInfo = {};  
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;  
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;  
+        beginInfo.pInheritanceInfo = &inheritanceInfo;  
 
         // Issue draw calls  
-        init.disp.beginCommandBuffer(secondaryCmdBufs[image_index], &beginInfo);
+        init.disp.beginCommandBuffer(secondaryCmdBufs[image_index], &beginInfo);  
         scene.renderScene(secondaryCmdBufs[image_index], width, height, image_index);
         init.disp.endCommandBuffer(secondaryCmdBufs[image_index]);
 
@@ -4154,7 +4308,7 @@ struct Engine {
 
     static float xoffset;
     static float yoffset;
-    static bool cursorEnabled;
+	static bool cursorEnabled;
 
     static void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
         static float lastX = 400, lastY = 300;
@@ -4203,10 +4357,10 @@ struct Engine {
             camera.ProcessKeyboard(RIGHT, deltaTime);
     }
 
-    void run() {
-        auto lastTime = std::chrono::high_resolution_clock::now();
+    void run() {  
+        auto lastTime = std::chrono::high_resolution_clock::now();  
 
-        while (!glfwWindowShouldClose(window)) {
+        while (!glfwWindowShouldClose(window)) {  
             auto currentTime = std::chrono::high_resolution_clock::now();
             deltaTime = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastTime).count();
             lastTime = currentTime;
@@ -4216,16 +4370,16 @@ struct Engine {
             }
             else toggleCursor(window, true);
 
-            processInput(scene.camera);
+			processInput(scene.camera);
 
             drawFrame();
 
-            //std::cout << glm::to_string(scene.camera.Position) << "\n";
+			//std::cout << glm::to_string(scene.camera.Position) << "\n";
 
             glfwPollEvents();
-
-        }
-        init.disp.deviceWaitIdle();
+             
+        }  
+        init.disp.deviceWaitIdle();  
     }
 };
 

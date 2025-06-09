@@ -69,17 +69,14 @@ struct Allocator {
     Allocator() {};
 
     ~Allocator() {
+
+        for (auto& mem : allocated) {
+            killMemory(mem.first, mem.second);
+        }
+
         if (!commandBuffers.empty()) {
             init->disp.freeCommandBuffers(commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
 			commandBuffers.clear();
-        }
-		
-        for(auto& [buf, mem] : allocated) {
-            killMemory(buf, mem);
-        }
-
-        for (auto& [im, mem] : images) {
-            killImage(im, mem);
         }
 
 		init->disp.destroyCommandPool(commandPool, nullptr);
@@ -103,12 +100,7 @@ struct Allocator {
         init->disp.freeMemory(memory, nullptr);
     }
 
-    void killImage(VkImage image, VkDeviceMemory memory) const {
-        init->disp.destroyImage(image, nullptr);
-        init->disp.freeMemory(memory, nullptr);
-    }
-
-    std::pair<VkBuffer, VkDeviceMemory> createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool usingDescriptors = true) {
+    std::pair<VkBuffer, VkDeviceMemory> createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool addToDeletionQueue = true) {
         VkBuffer buffer{};
 		VkDeviceMemory bufferMemory{};
 
@@ -139,43 +131,12 @@ struct Allocator {
         if (init->disp.bindBufferMemory(buffer, bufferMemory, 0) != VK_SUCCESS) {
             throw std::runtime_error("could not bind memory");
         }
-        allocated.emplace_back(buffer, bufferMemory);
+        if (addToDeletionQueue) {
+            allocated.emplace_back(buffer, bufferMemory);
+        }
+
         return { buffer, bufferMemory };
     };
-
-	std::pair<VkImage, VkDeviceMemory> createImage(VkDeviceSize width, VkDeviceSize height, uint32_t mipLevels, VkImageUsageFlags usage, VkImageType imageType, VkMemoryPropertyFlags properties, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM,VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, VkSharingMode sharingMode = VK_SHARING_MODE_EXCLUSIVE) {
-		VkImage image{};
-		VkDeviceMemory imageMemory{};
-		VkImageCreateInfo imageInfo{};
-		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-		imageInfo.imageType = imageType;
-		imageInfo.extent.width = static_cast<uint32_t>(width);
-		imageInfo.extent.height = static_cast<uint32_t>(height);
-		imageInfo.extent.depth = 1;
-		imageInfo.mipLevels = mipLevels;
-		imageInfo.arrayLayers = 1;
-		imageInfo.format = format;
-		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-		imageInfo.initialLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-		imageInfo.usage = usage;
-		imageInfo.samples = samples;
-		imageInfo.sharingMode = sharingMode;
-		init->disp.createImage(&imageInfo, nullptr, &image);
-		VkMemoryRequirements memRequirements;
-		init->disp.getImageMemoryRequirements(image, &memRequirements);
-		VkMemoryAllocateInfo allocInfo{};
-		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		allocInfo.allocationSize = memRequirements.size;
-		allocInfo.memoryTypeIndex = get_memory_index(*init, memRequirements.memoryTypeBits, properties);
-		if (init->disp.allocateMemory(&allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
-			throw std::runtime_error("could not allocate memory");
-		}
-		if (init->disp.bindImageMemory(image, imageMemory, 0) != VK_SUCCESS) {
-			throw std::runtime_error("could not bind memory");
-		}
-        images.emplace_back(image, imageMemory);
-		return { image, imageMemory };
-	}
 
     void fillBuffer(VkBuffer buffer, VkDeviceMemory memory, uint32_t data, VkDeviceSize offset = 0, VkDeviceSize range = VK_WHOLE_SIZE) {
 		auto cmd = beginSingleTimeCommands();
@@ -309,61 +270,6 @@ struct Allocator {
 		init->disp.freeMemory(stagingMemory, nullptr);
     }
 
-    void transitionImageLayout(
-        VkImage image,
-        VkFormat format,
-        VkImageLayout oldLayout,
-        VkImageLayout newLayout,
-        uint32_t mipLevels = 1) {
-        VkImageMemoryBarrier barrier{};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.oldLayout = oldLayout;
-        barrier.newLayout = newLayout;
-
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-
-        barrier.image = image;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.baseMipLevel = 0;
-        barrier.subresourceRange.levelCount = mipLevels;
-        barrier.subresourceRange.baseArrayLayer = 0;
-        barrier.subresourceRange.layerCount = 1;
-
-        // Determine source and destination stages
-        VkPipelineStageFlags sourceStage, destinationStage;
-
-        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
-            newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-            barrier.srcAccessMask = 0;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        }
-        else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-            newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        }
-        else {
-            throw std::invalid_argument("unsupported layout transition!");
-        }
-        auto cmd = beginSingleTimeCommands(true);
-        vkCmdPipelineBarrier(
-            commandBuffers[cmd],
-            sourceStage, destinationStage,
-            0,
-            0, nullptr,
-            0, nullptr,
-            1, &barrier
-        );
-        endSingleTimeCommands(true, true, true);
-    }
-
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset, bool async = false) {
         auto cmd = beginSingleTimeCommands();
         VkBufferCopy copyRegion{};
@@ -383,54 +289,6 @@ struct Allocator {
 		vkCmdCopyBuffer(commandBuffers[cmd], srcBuffer, dstBuffer, 1, &copyRegion);
         endSingleTimeCommands(true, false);
 	}
-
-    // only supports sqare images
-	void copyImage(VkImage srcImage, VkImage dstImage, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
-		auto cmd = beginSingleTimeCommands();
-		VkImageCopy copyRegion{};
-		copyRegion.extent.width = static_cast<uint32_t>(size);
-		copyRegion.extent.height = static_cast<uint32_t>(size);
-		copyRegion.extent.depth = 1;
-		copyRegion.dstOffset.x = static_cast<int32_t>(dstOffset);
-		copyRegion.dstOffset.y = static_cast<int32_t>(dstOffset);
-		copyRegion.srcOffset.x = static_cast<int32_t>(srcOffset);
-		copyRegion.srcOffset.y = static_cast<int32_t>(srcOffset);
-		vkCmdCopyImage(commandBuffers[cmd], srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
-		endSingleTimeCommands();
-	}
-
-    // does not support mipmaps or array textures
-    void copyBufferToImage2D(VkBuffer srcBuffer, VkImage dstImage, uint32_t width, uint32_t height) {
-        auto cmd = beginSingleTimeCommands();
-
-        VkBufferImageCopy region{};
-        region.bufferOffset = 0;
-        region.bufferRowLength = 0;
-        region.bufferImageHeight = 0;
-
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = 0;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = 1;
-
-        region.imageOffset = { 0, 0, 0 };
-        region.imageExtent = {
-            width,
-            height,
-            1
-        };
-
-        vkCmdCopyBufferToImage(
-            commandBuffers[cmd],
-            srcBuffer,
-            dstImage,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1,
-            &region
-        );
-
-		endSingleTimeCommands(true, true, false);
-    }
 
 	// this begins the command buffer recording process. Just record the commands in between this function's call and the submitSingleTimeCmd call
 	// submitSingleTimeCmd will NOT automatically end the command buffer!!
@@ -697,6 +555,12 @@ struct StandaloneBuffer {
 
     StandaloneBuffer() : allocator(nullptr) {}
 
+    ~StandaloneBuffer() {
+        allocator->init->disp.unmapMemory(stagingBufferMemory);
+        allocator->killMemory(stagingBuffer, stagingBufferMemory);
+        allocator->killMemory(buffer, bufferMemory);
+    }
+
     void init() {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(allocator->init->device.physical_device, &props);
@@ -854,10 +718,6 @@ struct StandaloneBuffer {
 		std::memset(memMap, 0, bufferSize);
 		return data;
     }
-
-    ~StandaloneBuffer() {
-        allocator->init->disp.unmapMemory(stagingBufferMemory);
-    };
 };
 
 // Bindless descriptor array of standaloneBuffers
@@ -888,9 +748,9 @@ struct BufferArray {
 
     BufferArray() {};
 
-    void destructor() {
-		allocator->init->disp.destroyDescriptorPool(descPool, nullptr);
-		allocator->init->disp.destroyDescriptorSetLayout(descSetLayout, nullptr);
+    ~BufferArray() {
+        allocator->init->disp.destroyDescriptorSetLayout(descSetLayout, nullptr);
+        allocator->init->disp.destroyDescriptorPool(descPool, nullptr);
     }
 
 	void push_back(StandaloneBuffer<bufferType>& buffer) {
@@ -1109,12 +969,6 @@ struct MemPool {
 
     MemPool() {};
 
-	
-
-    ~MemPool() {
-        allocator->init->disp.unmapMemory(stagingMemory);
-    }
-
     size_t size() {
         return buffers.size();
     }
@@ -1143,7 +997,7 @@ struct MemPool {
         allocator->init->disp.getBufferMemoryRequirements(stagingBuffer, &memRequirements);
 		auto stagingBufferSize = memRequirements.size;
 
-        // Step 1: Copy Data to Staging Buffer
+        // Copy Data to Staging Buffer
 		if (stagingBufferSize < alignedSize) {
             allocator->init->disp.unmapMemory(stagingMemory);
 			allocator->init->disp.destroyBuffer(stagingBuffer, nullptr);
@@ -1155,10 +1009,8 @@ struct MemPool {
 			allocator->init->disp.mapMemory(stagingMemory, 0, alignedSize, 0, &mapped);
 		}
         std::memcpy(mapped, data.data(), dataSize);
-
-        // Step 2: Copy Staging Buffer to GPU Buffer
+        // Copy Staging Buffer to GPU Buffer
         allocator->copyBuffer(stagingBuffer, buffer, alignedSize, 0, offset, true);
-
         // Clear the staging buffer memory
         std::memset(mapped, 0, alignedSize);
 
@@ -1183,7 +1035,7 @@ struct MemPool {
 
         // Check if there's enough space
         if (offset + data.capacity > capacity) {
-            grow(2);
+            growUntil(2, offset + data.capacity);
         }
 
         // Copy given buffer to GPU Buffer
@@ -1281,10 +1133,12 @@ struct MemPool {
 
     void growUntil(int factor, VkDeviceSize finalSize) {
         auto oldCapacity = capacity;
-
-        capacity *= factor;
-        capacity = (capacity + alignment - 1) & ~(alignment - 1);
-
+        
+        while (capacity < finalSize) {
+            capacity *= factor;
+            capacity = (capacity + alignment - 1) & ~(alignment - 1);
+        }
+        
         // Notice how we don't grow the staging buffer. This can cause problems when trying to download the buffer to host, but eeh
         auto newBuffer = allocator->createBuffer(capacity,
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -1302,14 +1156,7 @@ struct MemPool {
             buffer.buffer = newBuffer.first;
         }
         getBufferAddress();
-
-		if (capacity >= finalSize) {
-			// Internal handles were changed. We need descriptor updates
-			descUpdateQueued.trigger();
-        }
-        else {
-			growUntil(factor, finalSize);
-        }
+        descUpdateQueued.trigger();
     }
 
     // ez operation.

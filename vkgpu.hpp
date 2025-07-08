@@ -4,10 +4,10 @@
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_core.h>
 #include <typeinfo>
-#include <fstream>
 #include <iostream>
-#include <vector>
-
+#include <algorithm>
+#include "signal.hpp"
+#include "stb_image.h"
 
 struct Init {
     vkb::Instance instance;
@@ -67,12 +67,30 @@ struct Allocator {
     };
 
     Allocator() {};
+    size_t getAlignmemt() const {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(init->device.physical_device, &props);
+		return props.limits.minStorageBufferOffsetAlignment;
+	}
+    Allocator(Allocator& other) {
+        init = other.init;
+        allocQueue = other.allocQueue;
+        create_command_pool();
+		graphicsPool = other.graphicsPool;
+		graphicsQueue = other.graphicsQueue;
+    }
 
     ~Allocator() {
 
         for (auto& mem : allocated) {
-            killMemory(mem.first, mem.second);
+			init->disp.destroyBuffer(mem.first, nullptr);
+			init->disp.freeMemory(mem.second, nullptr);
         }
+
+		for (auto& img : images) {
+			init->disp.destroyImage(img.first, nullptr);
+			init->disp.freeMemory(img.second, nullptr);
+		}
 
         if (!commandBuffers.empty()) {
             init->disp.freeCommandBuffers(commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
@@ -82,21 +100,39 @@ struct Allocator {
 		init->disp.destroyCommandPool(commandPool, nullptr);
     }
     
-    size_t getAlignmemt() const {
-        VkPhysicalDeviceProperties props{};
-        vkGetPhysicalDeviceProperties(init->device.physical_device, &props);
-		return props.limits.minStorageBufferOffsetAlignment;
-	}
-    
-    Allocator(Allocator& other) {
-        init = other.init;
-        allocQueue = other.allocQueue;
-        commandPool = other.commandPool;
-        commandBuffers = other.commandBuffers;
+    void killMemory(VkBuffer buffer, VkDeviceMemory memory) {
+        if (buffer == VK_NULL_HANDLE || memory == VK_NULL_HANDLE) {
+            return;
+        }
+        auto it = std::find_if(allocated.begin(), allocated.end(),
+            [buffer, memory](const std::pair<VkBuffer, VkDeviceMemory>& pair) {
+                return pair.first == buffer && pair.second == memory;
+            });
+        if (it != allocated.end()) {
+            allocated.erase(it);
+        }
+        else {
+            std::cerr << "Warning: Attempted to kill memory that was not found in allocated list." << std::endl;
+        }
+        init->disp.destroyBuffer(buffer, nullptr);
+        init->disp.freeMemory(memory, nullptr);
     }
 
-    void killMemory(VkBuffer buffer, VkDeviceMemory memory) const {
-        init->disp.destroyBuffer(buffer, nullptr);
+    void killImage(VkImage image, VkDeviceMemory memory) {
+		if (image == VK_NULL_HANDLE || memory == VK_NULL_HANDLE) {
+			return;
+		}
+		auto it = std::find_if(images.begin(), images.end(),
+			[image, memory](const std::pair<VkImage, VkDeviceMemory>& pair) {
+				return pair.first == image && pair.second == memory;
+			});
+		if (it != images.end()) {
+			images.erase(it);
+		}
+		else {
+			std::cerr << "Warning: Attempted to kill image that was not found in allocated list." << std::endl;
+		}
+        init->disp.destroyImage(image, nullptr);
         init->disp.freeMemory(memory, nullptr);
     }
 
@@ -138,6 +174,40 @@ struct Allocator {
         return { buffer, bufferMemory };
     };
 
+	std::pair<VkImage, VkDeviceMemory> createImage(VkDeviceSize width, VkDeviceSize height, uint32_t mipLevels, VkImageUsageFlags usage, VkImageType imageType, VkMemoryPropertyFlags properties, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM,VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, VkSharingMode sharingMode = VK_SHARING_MODE_EXCLUSIVE) {
+		VkImage image{};
+		VkDeviceMemory imageMemory{};
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = imageType;
+		imageInfo.extent.width = static_cast<uint32_t>(width);
+		imageInfo.extent.height = static_cast<uint32_t>(height);
+		imageInfo.extent.depth = 1;
+		imageInfo.mipLevels = mipLevels;
+		imageInfo.arrayLayers = 1;
+		imageInfo.format = format;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageInfo.usage = usage;
+		imageInfo.samples = samples;
+		imageInfo.sharingMode = sharingMode;
+		init->disp.createImage(&imageInfo, nullptr, &image);
+		VkMemoryRequirements memRequirements;
+		init->disp.getImageMemoryRequirements(image, &memRequirements);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memRequirements.size;
+		allocInfo.memoryTypeIndex = get_memory_index(*init, memRequirements.memoryTypeBits, properties);
+		if (init->disp.allocateMemory(&allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+			throw std::runtime_error("could not allocate memory");
+		}
+		if (init->disp.bindImageMemory(image, imageMemory, 0) != VK_SUCCESS) {
+			throw std::runtime_error("could not bind memory");
+		}
+        images.emplace_back(image, imageMemory);
+		return { image, imageMemory };
+	}
+
     void fillBuffer(VkBuffer buffer, VkDeviceMemory memory, uint32_t data, VkDeviceSize offset = 0, VkDeviceSize range = VK_WHOLE_SIZE) {
 		auto cmd = beginSingleTimeCommands();
         vkCmdFillBuffer(commandBuffers[cmd], buffer, offset, range, data);
@@ -145,7 +215,7 @@ struct Allocator {
     }
 
 	// avoid as much as possible, this kills performance. But if you need to free memory, this is the way to do it.
-    void freeMemory(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize range) {  
+    void freeMemory(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {  
         // Step 1: Create a staging buffer to temporarily hold the data
         VkDeviceSize bufferSize;
 
@@ -181,8 +251,7 @@ struct Allocator {
         submitAllCommands(true);
 
         // Step 5: Clear the staging buffer
-        init->disp.destroyBuffer(stagingBuffer, nullptr);
-        init->disp.freeMemory(stagingMemory, nullptr);
+		killMemory(stagingBuffer, stagingMemory);
     }
 
 	// this overrides the memory in offset -> insertSize with toInsert(0 -> insertSize).
@@ -215,12 +284,11 @@ struct Allocator {
         submitAllCommands(true);
 
         // Step 6: Destroy staging buffer
-        init->disp.destroyBuffer(stagingBuffer, nullptr);
-        init->disp.freeMemory(stagingMemory, nullptr);
+		killMemory(stagingBuffer, stagingMemory);
     }
 
     // insert blob of memory into given buffer. Make sure given buffer has enough free space to handle the insert block, otherwise it'll kill the remaining trailing data
-    void insertMemory(VkBuffer buffer, VkDeviceMemory memory, VkBuffer& toInsert, VkDeviceSize offset, VkDeviceSize inSize) {
+    void insertMemory(VkBuffer buffer, VkBuffer& toInsert, VkDeviceSize offset, VkDeviceSize inSize) {
         VkMemoryRequirements req;
         init->disp.getBufferMemoryRequirements(buffer, &req);
         auto size = req.size;
@@ -238,8 +306,7 @@ struct Allocator {
 
         submitAllCommands(true);
 
-        init->disp.destroyBuffer(stagingBuffer, nullptr);
-        init->disp.freeMemory(stagingMemory, nullptr);
+		killMemory(stagingBuffer, stagingMemory);
     }
 
 	// this is a defragmenter. It will copy the good data from the original buffer to a new buffer, and then free the original buffer, killing the stale memory
@@ -266,11 +333,104 @@ struct Allocator {
 
 		submitAllCommands(true);
 
-		init->disp.destroyBuffer(stagingBuffer, nullptr);
-		init->disp.freeMemory(stagingMemory, nullptr);
+		killMemory(stagingBuffer, stagingMemory);
+    }
+
+    void transitionImageLayout(
+        VkImage image,
+        VkFormat format,
+        VkImageLayout oldLayout,
+        VkImageLayout newLayout,
+        uint32_t mipLevels = 1) {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = newLayout;
+
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+        barrier.image = image;
+		if (format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+			format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D16_UNORM_S8_UINT) {
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		}
+		else {
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		}
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = mipLevels;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        // Determine source and destination stages
+        VkPipelineStageFlags sourceStage, destinationStage;
+
+        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+            newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        }
+        else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+            newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        }
+        else if (oldLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+			barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			sourceStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+			destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		}
+        else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+			barrier.srcAccessMask = 0;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+			destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		}
+		else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+			barrier.srcAccessMask = 0;
+			barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+			destinationStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		}
+		else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+			barrier.srcAccessMask = 0;
+			barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+			sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+			destinationStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        }
+        else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        }
+        else {
+            throw std::invalid_argument("unsupported layout transition!");
+        }
+        auto cmd = beginSingleTimeCommands(true);
+        vkCmdPipelineBarrier(
+            commandBuffers[cmd],
+            sourceStage, destinationStage,
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &barrier
+        );
+        endSingleTimeCommands(true, true, true);
     }
 
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset, bool async = false) {
+		if (size == 0) {
+			return;
+		}
         auto cmd = beginSingleTimeCommands();
         VkBufferCopy copyRegion{};
         copyRegion.size = size;
@@ -281,6 +441,9 @@ struct Allocator {
     }
 
 	void sequentialCopyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
+		if (size == 0) {
+			return;
+		}
         auto cmd = beginSingleTimeCommands();
 		VkBufferCopy copyRegion{};
 		copyRegion.size = size;
@@ -289,6 +452,54 @@ struct Allocator {
 		vkCmdCopyBuffer(commandBuffers[cmd], srcBuffer, dstBuffer, 1, &copyRegion);
         endSingleTimeCommands(true, false);
 	}
+
+    // only supports sqare images
+	void copyImage(VkImage srcImage, VkImage dstImage, VkDeviceSize size, VkDeviceSize srcOffset, VkDeviceSize dstOffset) {
+		auto cmd = beginSingleTimeCommands();
+		VkImageCopy copyRegion{};
+		copyRegion.extent.width = static_cast<uint32_t>(size);
+		copyRegion.extent.height = static_cast<uint32_t>(size);
+		copyRegion.extent.depth = 1;
+		copyRegion.dstOffset.x = static_cast<int32_t>(dstOffset);
+		copyRegion.dstOffset.y = static_cast<int32_t>(dstOffset);
+		copyRegion.srcOffset.x = static_cast<int32_t>(srcOffset);
+		copyRegion.srcOffset.y = static_cast<int32_t>(srcOffset);
+		vkCmdCopyImage(commandBuffers[cmd], srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+		endSingleTimeCommands();
+	}
+
+    // does not support mipmaps or array textures
+    void copyBufferToImage2D(VkBuffer srcBuffer, VkImage dstImage, uint32_t width, uint32_t height) {
+        auto cmd = beginSingleTimeCommands();
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+
+        region.imageOffset = { 0, 0, 0 };
+        region.imageExtent = {
+            width,
+            height,
+            1
+        };
+
+        vkCmdCopyBufferToImage(
+            commandBuffers[cmd],
+            srcBuffer,
+            dstImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &region
+        );
+
+		endSingleTimeCommands(true, true, false);
+    }
 
 	// this begins the command buffer recording process. Just record the commands in between this function's call and the submitSingleTimeCmd call
 	// submitSingleTimeCmd will NOT automatically end the command buffer!!
@@ -470,7 +681,7 @@ private:
     }
 };
 
-// lone wolf buffer. Has its own VkDeviceMemory. Uses a staging buffer to copy memory from host to GPU high-performance memory
+// Like std::vector. Has its own VkDeviceMemory. Uses a staging buffer to copy memory from host to GPU high-performance memory
 template<typename T>
 struct StandaloneBuffer {
     VkBuffer buffer{};
@@ -491,7 +702,6 @@ struct StandaloneBuffer {
     VkDescriptorBufferInfo desc_buf_info{};
     uint32_t bindingIndex;
 
-	// for transfer operations to be done on seperate queue
 	Allocator* allocator;
 
 	VkShaderStageFlagBits flags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -555,12 +765,6 @@ struct StandaloneBuffer {
 
     StandaloneBuffer() : allocator(nullptr) {}
 
-    ~StandaloneBuffer() {
-        allocator->init->disp.unmapMemory(stagingBufferMemory);
-        allocator->killMemory(stagingBuffer, stagingBufferMemory);
-        allocator->killMemory(buffer, bufferMemory);
-    }
-
     void init() {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(allocator->init->device.physical_device, &props);
@@ -571,13 +775,13 @@ struct StandaloneBuffer {
 
         // Create the staging buffer
         auto stageBuff = allocator->createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         stagingBuffer = stageBuff.first;
         stagingBufferMemory = stageBuff.second;
 
         // Create the buffer
         auto buff = allocator->createBuffer(capacity, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         buffer = buff.first;
         bufferMemory = buff.second;
         allocator->init->disp.mapMemory(stagingBufferMemory, 0, capacity, 0, &memMap);
@@ -591,7 +795,125 @@ struct StandaloneBuffer {
         std::cout << "wefwef\n";
     }
 
-	VkDeviceAddress getBufferAddress() {
+    template<typename T>
+    void addListener(T* listener){
+		descUpdateQueued.addListener(listener);
+    }
+
+    void set(int idx, const T& data) {  
+        if (memMap == nullptr) {  
+            std::cerr << "memMap is null, cannot write data to buffer\n";  
+            return;  
+        }  
+        if (idx < 0 || idx >= numElements) {  
+            std::cerr << "Index out of bounds: " << idx << "\n";  
+            return;  
+        }  
+        std::memcpy(memMap, &data, sizeof(T));  
+
+        allocator->copyBuffer(stagingBuffer, buffer, sizeof(T), idx * sizeof(T), 0, true);  
+
+        std::memset(memMap, 0, sizeof(T));  
+    }
+
+	T get(int idx) const {
+		if (memMap == nullptr) {
+			std::cerr << "memMap is null, cannot read data from buffer\n";
+			return T{};
+		}
+		if (idx < 0 || idx >= numElements) {
+			std::cerr << "Index out of bounds: " << idx << "\n";
+			return T{};
+		}
+		// download data from gpu
+		allocator->copyBuffer(buffer, stagingBuffer, sizeof(T), idx * sizeof(T), 0, true);
+        auto data = *reinterpret_cast<T*>(static_cast<char*>(memMap) + idx * sizeof(T));
+        std::memset(memMap, 0, capacity);
+        return data;
+	}
+
+    void push_back(const T& data) {
+        if (numElements * sizeof(T) >= capacity) {
+            grow(2); // double the capacity
+        }
+        set(numElements, data);
+        numElements++;
+    }
+    
+	T pop_back() {
+		if (numElements == 0) {
+			std::cerr << "Buffer is empty, cannot pop back\n";
+			return T{};
+		}
+		numElements--;
+		T data = get(numElements);
+		set(numElements, T{}); // clear the last element
+		return data;
+	}
+
+	void erase(int idx) {
+		if (idx < 0 || idx >= numElements) {
+			std::cerr << "Index out of bounds: " << idx << "\n";
+			return;
+		}
+		allocator->freeMemory(buffer, idx * sizeof(T), sizeof(T));
+		numElements--;
+	}
+
+	void insert(int idx, T& data) {
+		if (idx < 0 || idx > numElements) {
+			std::cerr << "Index out of bounds: " << idx << "\n";
+			return;
+		}
+		if (numElements * sizeof(T) >= capacity) {
+			grow(2); // double the capacity
+		}
+
+		std::memcpy(memMap, &data, sizeof(T));
+        allocator->insertMemory(buffer, stagingBuffer, idx * sizeof(T), sizeof(T));
+		std::memset(memMap, 0, sizeof(T));
+		numElements++;
+	}
+
+    void replace(int idx, T& data) {
+        if (idx < 0 || idx >= numElements) {
+            std::cerr << "Index out of bounds: " << idx << "\n";
+            return;
+        }
+		set(idx, data);
+    }
+
+    // Allocate data into the buffer. Each alloc will overwrite the previous data in the buffer.
+    void alloc(std::vector<T> data) {
+        auto sizeOfData = static_cast<uint32_t>(sizeof(T) * data.size());
+		if (sizeOfData > capacity) {
+			std::cout << "Data size exceeds buffer capacity. Growing buffer...\n";
+			growUntil(2, data.size());
+		}
+
+        VkMemoryRequirements memRequirements{};
+        allocator->init->disp.getBufferMemoryRequirements(stagingBuffer, &memRequirements);
+        auto stagingBufferSize = memRequirements.size;
+
+        // Copy Data to Staging Buffer
+        if (stagingBufferSize < sizeOfData) {
+            allocator->init->disp.unmapMemory(stagingBufferMemory);
+            allocator->killMemory(stagingBuffer, stagingBufferMemory);
+            auto stageBuff = allocator->createBuffer(sizeOfData, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            stagingBuffer = stageBuff.first;
+            stagingBufferMemory = stageBuff.second;
+            allocator->init->disp.mapMemory(stagingBufferMemory, 0, sizeOfData, 0, &memMap);
+        }
+
+        std::memcpy(memMap, data.data(), sizeOfData);
+        allocator->copyBuffer(stagingBuffer, buffer, sizeOfData, 0, 0, true);
+		std::memset(memMap, 0, sizeOfData);
+
+		numElements = static_cast<uint32_t>(data.size());
+    }
+	
+    VkDeviceAddress getBufferAddress() {
         VkBufferDeviceAddressInfoEXT bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
         bufferInfo.buffer = buffer;
@@ -648,17 +970,7 @@ struct StandaloneBuffer {
     void clearBuffer() {
         if (allocator != nullptr) {
             allocator->freeMemory(buffer, bufferMemory, 0, capacity);
-            allocator->freeMemory(stagingBuffer, stagingBufferMemory, 0, capacity);
         }
-    }
-
-	// Allocate data into the buffer. Each alloc will overwrite the previous data in the buffer.
-    void alloc(std::vector<T>& data) {
-        auto sizeOfData = static_cast<uint32_t>(sizeof(T) * data.size());
-        std::memcpy(memMap, data.data(), sizeOfData);
-        allocator->copyBuffer(stagingBuffer, buffer, sizeOfData, 0, 0, true);
-		std::memset(memMap, 0, sizeOfData);
-		numElements = static_cast<uint32_t>(data.size());
     }
 
     void grow(int factor) {
@@ -667,12 +979,10 @@ struct StandaloneBuffer {
 		capacity = (capacity + alignment - 1) & ~(alignment - 1);
 
 		auto [buf, mem] = allocator->createBuffer(capacity, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
 		allocator->copyBuffer(buffer, buf, oldCapacity, 0, 0, true);
-
-        allocator->init->disp.destroyBuffer(buffer, nullptr);
-		allocator->init->disp.freeMemory(bufferMemory, nullptr);
+		allocator->killMemory(buffer, bufferMemory);
 		buffer = buf;
 		bufferMemory = mem;
 
@@ -682,16 +992,43 @@ struct StandaloneBuffer {
         descUpdateQueued.trigger();
     }
 
+    // newSize is element size, not byte size
+    void growUntil(int factor, uint32_t newSize) {
+        auto oldCapacity = capacity;
+        while (capacity < newSize * sizeof(T)) {
+            capacity *= factor;
+            capacity = (capacity + alignment - 1) & ~(alignment - 1);
+        }
+		auto [buf, mem] = allocator->createBuffer(capacity, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+		
+        allocator->copyBuffer(buffer, buf, oldCapacity, 0, 0, true);
+		allocator->killMemory(buffer, bufferMemory);
+		buffer = buf;
+		bufferMemory = mem;
+
+		getBufferAddress();
+		// the internal handles were changed. We need descriptor updates
+		descUpdateQueued.trigger();
+    }
+
     // newSize is size of buffer in elements, NOT bytes
-    void resize(uint32_t newSize) {
+    void resize(size_t newSize) {
         auto prevCapacity = capacity;
 		capacity = newSize * sizeof(T);
 		capacity = (capacity + alignment - 1) & ~(alignment - 1);
 
 		auto [buf, mem] = allocator->createBuffer(capacity, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
 		allocator->copyBuffer(buffer, buf, prevCapacity, 0, 0, true);
-		allocator->init->disp.destroyBuffer(buffer, nullptr);
-		allocator->init->disp.freeMemory(bufferMemory, nullptr);
+		allocator->killMemory(buffer, bufferMemory);
+        
+		auto [stagingBuf, stagingMem] = allocator->createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, true);
+		allocator->init->disp.unmapMemory(stagingBufferMemory);
+		allocator->killMemory(stagingBuffer, stagingBufferMemory);
+
+		stagingBuffer = stagingBuf;
+		stagingBufferMemory = stagingMem;
+		allocator->init->disp.mapMemory(stagingBufferMemory, 0, capacity, 0, &memMap);
 
 		buffer = buf;
 		bufferMemory = mem;
@@ -854,14 +1191,14 @@ struct BufferArray {
 template<typename T>
 struct Buffer {
     VkBuffer buffer;                      // Points to the MemPool's buffer
-    VkDeviceSize offset;                  // Byte Offset within the buffer
-	uint32_t elementOffset;               // Element Offset within the buffer
-    uint32_t numElements;                 // Number of elements in this buffer
+    VkDeviceSize offset = 0;                  // Byte Offset within the buffer
+	uint32_t elementOffset = 0;               // Element Offset within the buffer
+    uint32_t numElements = 0;                 // Number of elements in this buffer
 	VkDeviceSize alignedSize(VkDeviceSize alignment) { return (numElements * sizeof(T) + alignment - 1) & ~(alignment - 1); } // Return the aligned byte size of this buffer element
 	VkDeviceSize size() { return numElements * sizeof(T); } // Return the byte size of this buffer element
 
     // Descriptor set members (used when MemPool is not using bypassDescriptors)
-    uint32_t bindingIndex;
+    uint32_t bindingIndex = 0;
     VkDescriptorSetLayoutBinding binding{};
     VkWriteDescriptorSet wrt_desc_set{};
     VkDescriptorBufferInfo desc_buf_info{};
@@ -890,12 +1227,12 @@ struct Buffer {
     }
 };
 
-// like std::vector, but worse. And for the GPU. Only handles Storage buffers. For Uniform buffers, use different struct
+// like std::vector<std::vector<T>>, but worse. And for the GPU. Only handles Storage buffers. For Uniform buffers, use StandaloneBuffer
 // Each input is a seperate descriptor binding, but same set.
 // Can update buffer offsets and even buffer handles if defragmented or resized. Shoots a Signal struct to all using resources. Resources using this pool must register themselves as a 
 // signal listener and submit their onSignal() function ptr to the pool's Signal. When internal descriptors are updated, you need to pause your pipeline's execution and update descriptors
-// This is useful for dynamic memory allocation where all scene mesh data is allocated together, in one MemPool (won't work now cause we can't have custom buffer usage here yet, 
-// only STORAGE_BUFFER is supported). You shouldn't need to use any defragmentation or resize operations if you're using this for training Machine Learning tensors.
+// This is useful for dynamic memory allocation where all scene mesh data is allocated together, in one MemPool (as shown in VkCalcium.hpp). 
+// You shouldn't need to use any defragmentation or resize operations if you're using this for training Machine Learning tensors.
 template<typename T>
 struct MemPool {
     VkBuffer buffer;               // Single buffer for all allocations on GPU
@@ -973,6 +1310,11 @@ struct MemPool {
         return buffers.size();
     }
     
+    template<typename T>
+    void addListener(T* listener) {
+		descUpdateQueued.addListener(listener);
+    }
+
 	VkDeviceAddress getBufferAddress() {
 		VkBufferDeviceAddressInfoEXT bufferInfo{};
 		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT;
@@ -1000,8 +1342,7 @@ struct MemPool {
         // Copy Data to Staging Buffer
 		if (stagingBufferSize < alignedSize) {
             allocator->init->disp.unmapMemory(stagingMemory);
-			allocator->init->disp.destroyBuffer(stagingBuffer, nullptr);
-			allocator->init->disp.freeMemory(stagingMemory, nullptr);
+			allocator->killMemory(stagingBuffer, stagingMemory);
 			auto stageBuff = allocator->createBuffer(alignedSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 			stagingBuffer = stageBuff.first;
@@ -1012,16 +1353,18 @@ struct MemPool {
         // Copy Staging Buffer to GPU Buffer
         allocator->copyBuffer(stagingBuffer, buffer, alignedSize, 0, offset, true);
         // Clear the staging buffer memory
-        std::memset(mapped, 0, alignedSize);
+        std::memset(mapped, 0, dataSize);
 
-        // Create a Buffer entry
-        Buffer<T> newBuffer;
-        newBuffer.buffer = buffer;
-        newBuffer.offset = offset;
-		newBuffer.elementOffset = elementOffset;
-        newBuffer.numElements = static_cast<uint32_t>(data.size());
-        newBuffer.createDescriptors(bindingIndex, flags);
-        buffers.push_back(newBuffer);
+        // Create a Buffer entry (Created on the heap, because stack memory apparently overflows)
+        auto newBuffer = new Buffer<T>();
+        newBuffer->buffer = buffer;
+        newBuffer->offset = offset;
+		newBuffer->elementOffset = elementOffset;
+        newBuffer->numElements = static_cast<uint32_t>(data.size());
+        newBuffer->createDescriptors(bindingIndex, flags);
+        // dereference ptr and push copy into the vector
+        buffers.push_back(*newBuffer);
+		delete newBuffer; // Free the heap memory
 
         // Update offset for next allocation
         offset += alignedSize;
@@ -1042,12 +1385,13 @@ struct MemPool {
         allocator->copyBuffer(data.buffer, buffer, data.capacity, 0, offset, true);
 
         // Create a Buffer entry
-        Buffer<T> newBuffer;
-        newBuffer.buffer = buffer;
-        newBuffer.offset = offset;
-        newBuffer.numElements = static_cast<uint32_t>(data.capacity / sizeof(T));
-        newBuffer.createDescriptors(bindingIndex, flags);
-        buffers.push_back(newBuffer);
+        auto newBuffer = new Buffer<T>();
+        newBuffer->buffer = buffer;
+        newBuffer->offset = offset;
+        newBuffer->numElements = static_cast<uint32_t>(data.capacity / sizeof(T));
+        newBuffer->createDescriptors(bindingIndex, flags);
+        buffers.push_back(*newBuffer);
+		delete newBuffer; // Free the heap memory
         // Update offset for next allocation
         offset += data.capacity;
         elementOffset += data.numElements;
@@ -1078,16 +1422,16 @@ struct MemPool {
     // resizes the memPool to the given newSize. This doesn't destroy data in the original buffer.
     void resize(int newSize) {
         // Calculate total size with alignment
+        auto oldCapacity = capacity;
         capacity = newSize * sizeof(T);
         capacity = (capacity + alignment - 1) & ~(alignment - 1);
 
         auto newBuffer = allocator->createBuffer(capacity,
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        allocator->copyBuffer(buffer, newBuffer.first, capacity, 0, 0, true);
+        allocator->copyBuffer(buffer, newBuffer.first, oldCapacity, 0, 0, true);
 
-        allocator->init->disp.destroyBuffer(buffer, nullptr);
-        allocator->init->disp.freeMemory(memory, nullptr);
+		allocator->killMemory(buffer, memory);
 
         buffer = newBuffer.first;
         memory = newBuffer.second;
@@ -1115,9 +1459,7 @@ struct MemPool {
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         allocator->copyBuffer(buffer, newBuffer.first, oldCapacity, 0, 0, true);
-
-        allocator->init->disp.destroyBuffer(buffer, nullptr);
-        allocator->init->disp.freeMemory(memory, nullptr);
+		allocator->killMemory(buffer, memory);
 
         buffer = newBuffer.first;
         memory = newBuffer.second;
@@ -1146,12 +1488,11 @@ struct MemPool {
 
         allocator->copyBuffer(buffer, newBuffer.first, oldCapacity, 0, 0, true);
 
-        allocator->init->disp.destroyBuffer(buffer, nullptr);
-        allocator->init->disp.freeMemory(memory, nullptr);
+		allocator->killMemory(buffer, memory);
 
         buffer = newBuffer.first;
         memory = newBuffer.second;
-
+        
         for (auto& buffer : buffers) {
             buffer.buffer = newBuffer.first;
         }
@@ -1180,38 +1521,30 @@ struct MemPool {
     }
 
     // expensive operation if instaClean is turned on. Use with caution.
-    std::vector<T> erase(uint32_t index, bool instaClean = true) {
+    void erase(uint32_t index, bool instaClean = true) {
         if (index >= buffers.size()) {
             throw std::out_of_range("Index out of range");
         }
-        if (buffers.size <= 0) {
+        if (buffers.size() <= 0) {
             throw std::exception("MemPool has nothing left to erase.");
         }
         auto& buf = buffers[index];
         auto alignedSize = buf.alignedSize(alignment);
 		auto elementSize = buf.numElements;
         auto dataSize = buf.size();
-        // Copy Data from GPU Buffer to Staging Buffer
-        allocator->copyBuffer(buffer, stagingBuffer, dataSize, buf.offset, 0, true);
-        std::vector<T> output(buf.numElements);
-        std::memcpy(output.data(), mapped, dataSize);
-        std::memset(mapped, 0, alignedSize);
 
         // free buffer memory and manage offsets accordingly
         if (instaClean) {
             // free the blob of erased memory, push the remaining memory towards the left and zero out the tail of straggling memory
-            allocator->freeMemory(buffer, memory, ((buf.offset + alignment - 1) & ~(alignment - 1)), alignedSize);
+            allocator->freeMemory(buffer, buf.offset, alignedSize);
             // Update offset for next allocation
             offset -= alignedSize;
             occupied -= alignedSize;
             // Update the offset of the remaining buffers
             for (size_t i = index; i < buffers.size(); ++i) {
                 buffers[i].offset -= alignedSize;
-				elementOffset -= elementSize;
+				buffers[i].elementOffset -= elementSize;
             }
-
-            // internal offsets were changed. We need descriptor updates
-            descUpdateQueued.trigger();
         }
         // just record the gap and leave it there. The record of the gaps can be cleaned up later. Kind of like a garbage collector.
         else {
@@ -1226,7 +1559,6 @@ struct MemPool {
         }
 
         descUpdateQueued.trigger();
-        return output;
     }
 
     // garbage collector (kinda)
@@ -1273,8 +1605,8 @@ struct MemPool {
         const VkDeviceSize alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
 
         // Check if there's enough space
-        if (((offset + alignedSize) - buffers[index].alignedSize(alignment)) > capacity) {
-            grow(2);
+        if ((offset + alignedSize) - buffers[index].alignedSize(alignment) > capacity) {
+            growUntil(2, (offset + alignedSize) - buffers[index].alignedSize(alignment));
         }
 
         auto alignedOffset = buffers[index].offset;
@@ -1318,7 +1650,7 @@ struct MemPool {
 
         // Check if there's enough space
         if (((offset + alignedSize) - buffers[index].alignedSize(alignment)) > capacity) {
-            grow(2);
+            growUntil(2, (offset + alignedSize) - buffers[index].alignedSize(alignment));
         }
 
         auto alignedOffset = buffers[index].offset;
@@ -1358,22 +1690,23 @@ struct MemPool {
         auto alignedSize = (data.size() * sizeof(T) + alignment - 1) & ~(alignment - 1);
 
         if (capacity < occupied + alignedSize) {
-            grow(2);
+            growUntil(2, occupied + alignedSize);
         }
 
         // we're using the staging buffer to hold the toInsert memory
         std::memcpy(mapped, data.data(), data.size() * sizeof(T));
-        allocator->insertMemory(buffer, memory, stagingBuffer, buffers[index].offset, alignedSize);
+        allocator->insertMemory(buffer, stagingBuffer, buffers[index].offset, alignedSize);
         std::memset(mapped, 0, data.size() * sizeof(T));
 
         // Create a Buffer entry
-        Buffer<T> newBuffer;
-        newBuffer.buffer = buffer;
-        newBuffer.offset = buffers[index].offset;
-        newBuffer.numElements = static_cast<uint32_t>(data.size());
-		newBuffer.elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
-        newBuffer.createDescriptors(index, flags);
-        buffers.insert(buffers.begin() + index, newBuffer);
+        auto newBuffer = new Buffer<T>();
+        newBuffer->buffer = buffer;
+        newBuffer->offset = buffers[index].offset;
+        newBuffer->numElements = static_cast<uint32_t>(data.size());
+		newBuffer->elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
+        newBuffer->createDescriptors(index, flags);
+        buffers.insert(buffers.begin() + index, *newBuffer);
+		delete newBuffer; // Free the heap memory
 
         // Update offset for next allocation
         offset += alignedSize;
@@ -1397,19 +1730,20 @@ struct MemPool {
         auto alignedSize = data.capacity;
 
         if (capacity < occupied + alignedSize) {
-            grow(2);
+            growUntil(2, occupied + alignedSize);
         }
 
-        allocator->insertMemory(buffer, memory, data.buffer, buffers[index].offset, alignedSize);
+        allocator->insertMemory(buffer, data.buffer, buffers[index].offset, alignedSize);
 
         // Create a Buffer entry
-        Buffer<T> newBuffer;
-        newBuffer.buffer = buffer;
-        newBuffer.offset = buffers[index].offset;
-		newBuffer.elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
-        newBuffer.numElements = static_cast<uint32_t>(data.capacity / sizeof(T));
-        newBuffer.createDescriptors(index, flags);
-        buffers.insert(buffers.begin() + index, newBuffer);
+        auto newBuffer = new Buffer<T>();
+        newBuffer->buffer = buffer;
+        newBuffer->offset = buffers[index].offset;
+		newBuffer->elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
+        newBuffer->numElements = static_cast<uint32_t>(data.capacity / sizeof(T));
+        newBuffer->createDescriptors(index, flags);
+        buffers.insert(buffers.begin() + index, *newBuffer);
+		delete newBuffer; // Free the heap memory
 
         // Update offset for next allocation
         offset += alignedSize;
@@ -1446,16 +1780,16 @@ struct MemPool {
         return bufs;
     }
 
-    void printPool() {
-        auto allBufs = downloadBuffers();
+    void printPool() {  
+        auto allBufs = downloadBuffers();  
 
-        for (int i = 0; i < allBufs.size(); i++) {
-            std::cout << "buffer number " << i << "\n\t";
-            for (auto& ele : allBufs[i]) {
-                std::cout << ele << " ";
-            }
-            std::cout << "\n";
-        }
+        for (int i = 0; i < allBufs.size(); i++) {  
+            std::cout << "buffer number " << i << "\n\t";  
+            for (auto& ele : allBufs[i]) {  
+                std::cout << ele << "\n";  
+            }  
+            std::cout << "\n";  
+        }  
     }
 };
 

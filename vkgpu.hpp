@@ -1804,9 +1804,6 @@ private:
     VkCommandPool command_pool;
     VkCommandBuffer command_buffer;
 
-    // the input buffers are inside the buffers pool
-    MemPool<T> buffers;
-
     // the output is a standalone buffer
     StandaloneBuffer<T> output;
 
@@ -1822,6 +1819,8 @@ private:
     Init& init; // global vulkan handles
 
     std::vector<char> spv_code = std::vector<char>{};// we'll have shader bytecode in this
+    
+    std::function<void()> callback;
 
     //get the compute queue family inside the GPU
     int get_queues() {
@@ -1939,7 +1938,30 @@ private:
     }
 
 public:
-    gpuTask(std::vector<char>& spvByteCodeCompShader, Init& init, uint32_t numInputs) : spv_code(spvByteCodeCompShader), init(init), buffers(MemPool<T>(&init, numInputs)) {};
+    // must have function, because this class is a listener object. It must be named in this exact way
+    // NEEDS TO BE A PUBLIC METHOD
+	void onSignal() {
+		// this is called when the memPool or output buffer broadcasts a signal
+        std::cout << "Signal Called\n";
+        if (callback) {
+            callback();
+        }
+	}
+
+    template<typename Func, typename... Args>
+    void setCallback(Func&& func, Args&&... args) {
+        callback = [&func, &...capturedArgs = args]() mutable {
+            std::invoke(func, capturedArgs...);
+            };
+    }
+
+    gpuTask(std::vector<char>& spvByteCodeCompShader, Init& init, uint32_t numInputs, uint32_t numOutputs, Allocator* allocator) : spv_code(spvByteCodeCompShader), init(init), buffers(MemPool<T>(numInputs, allocator)), output(numOutputs, allocator) {
+        get_queues();
+        create_command_pool();
+
+		buffers.descUpdateQueued.addListener(this);
+		output.descUpdateQueued.addListener(this);
+    };
     gpuTask(gpuTask& base, uint32_t numInputs) {
         init = base.init;
         queue = base.queue;
@@ -1952,6 +1974,7 @@ public:
         descriptor_set_layout = base.descriptor_set_layout;
         buffers = MemPool<T>(&init, numInputs);
     }
+    MemPool<T> buffers;
     // load floating point inputs into GPU memory using memory staging:
     void load_inputs(std::vector<std::vector<T>>& input_data) {
         // Ensure input vectors are properly sized
@@ -1966,30 +1989,15 @@ public:
         create_descriptors();
         create_pipeline();
     }
-
+    
     void updateBuffers() {
         numInputs = buffers.size();
         create_descriptors();
         create_pipeline();
     }
 
-    void initiateCompute() {
-        get_queues();
-        create_command_pool();
-        buffers.commandPool = command_pool;
-        buffers.computeQueue = queue;
-
-        // --- Create Output Buffer ---
-        output.init = &init;
-        output.computeQueue = queue;
-        output.commandPool = command_pool;
-        output.bindingIndex = buffers.buffers.size();
-        auto outputBuf = std::vector<T>(10);
-        output.alloc(outputBuf, 10);
-    }
-
     std::vector<T> compute() {
-
+        
         // --- Begin command buffer recording ---
         VkCommandBufferBeginInfo begin_info = {};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -2023,15 +2031,11 @@ public:
         // Wait for GPU to finish computation
         init.disp.waitForFences(1, &compute_fence, VK_TRUE, UINT64_MAX);
 
-        // Retrieve results from output buffer
-        std::vector<T> result(10);
-        output.downloadBuffer(result, 3);
-
         // Cleanup fence
         init.disp.destroyFence(compute_fence, nullptr);
         cleanup();
 
-        return result;
+        return output.downloadBuffer();
     }
 
     ~gpuTask() {}
@@ -2088,7 +2092,6 @@ private:
             bindings[i] = memPool.buffers[inputIndices[i]].binding;
         }
         for (uint32_t i = 0; i < outputIndices.size(); i++) {
-            // this took me embarrasingly long to figure out... :(
             bindings[i + inputIndices.size()] = memPool.buffers[outputIndices[i]].binding;
         }
 
@@ -2113,7 +2116,6 @@ private:
         // output buffers
         for (uint32_t i = 0; i < outputIndices.size(); i++) {
             memPool.buffers[outputIndices[i]].updateDescriptorSet(descriptor_set);
-            // this took me embarrasingly long to figure out... :(
             write_desc_sets[i + inputIndices.size()] = memPool.buffers[outputIndices[i]].wrt_desc_set;
         }
 
@@ -2154,6 +2156,12 @@ private:
     }
 
 public:
+    // must have function, because this class is a listener object. It must be named in this exact way
+    // NEED TO BE PUBLIC
+    void onSignal() {
+        // this is called when the memPool broadcasts a signal
+    }
+
     SequentialgpuTask(std::vector<char>& spvByteCodeCompShader, Init& init) : spv_code(spvByteCodeCompShader), init(init) {};
 
     // load buffer indices. The buffers themselves are stored in one massive MemPool in the ComputeSequence for efficiency
@@ -2186,11 +2194,11 @@ private:
     }
 };
 
-// copy-pasted from the compute shader example of VkBootstrap
 int device_initialization(Init& init) {
     vkb::InstanceBuilder instance_builder;
     auto instance_ret = instance_builder.use_default_debug_messenger()
         .request_validation_layers()
+        .require_api_version(VK_API_VERSION_1_3) // Important!  
         .set_headless() // Skip vk-bootstrap trying to create WSI for you
         .build();
     if (!instance_ret) {
@@ -2201,8 +2209,16 @@ int device_initialization(Init& init) {
 
     init.inst_disp = init.instance.make_table();
 
+    VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features = {};
+    buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+    buffer_device_address_features.bufferDeviceAddress = VK_TRUE;
+
     vkb::PhysicalDeviceSelector phys_device_selector(init.instance);
-    auto phys_device_ret = phys_device_selector.select();
+    auto phys_device_ret = phys_device_selector
+        .add_required_extension(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)
+        .add_required_extension_features(buffer_device_address_features)
+        .select();
+
     if (!phys_device_ret) {
         std::cout << phys_device_ret.error().message() << "\n";
         return -1;
@@ -2227,7 +2243,6 @@ int device_initialization(Init& init) {
 template<typename T>
 struct ComputeSequence {
     std::vector<SequentialgpuTask<T>> tasks;
-    Init* init;
     VkQueue queue;
     VkCommandPool commandPool;
     VkDescriptorPool descriptorPool;
@@ -2236,11 +2251,16 @@ struct ComputeSequence {
     VkCommandBuffer command_buffer;
     MemPool<T> allBuffers;
 
-    ComputeSequence(Init* init, uint32_t numBuffers) : init(init), allBuffers(init, numBuffers) {};
+    Allocator* allocator;
+
+    ComputeSequence(uint32_t numBuffers, Allocator* allocator) : allocator(allocator), allBuffers(numBuffers, allocator) {
+        get_queues();
+        create_command_pool();
+    };
 
     //get the compute queue family inside the GPU
     int get_queues() {
-        auto gq = init->device.get_queue(vkb::QueueType::compute);
+        auto gq = allocator->init->device.get_queue(vkb::QueueType::compute);
         if (!gq.has_value()) {
             std::cout << "failed to get queue: " << gq.error().message() << "\n";
             return -1;
@@ -2252,8 +2272,8 @@ struct ComputeSequence {
     void create_command_pool() {
         VkCommandPoolCreateInfo pool_info = {};
         pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        pool_info.queueFamilyIndex = init->device.get_queue_index(vkb::QueueType::compute).value();
-        init->disp.createCommandPool(&pool_info, nullptr, &commandPool);
+        pool_info.queueFamilyIndex = allocator->init->device.get_queue_index(vkb::QueueType::compute).value();
+        allocator->init->disp.createCommandPool(&pool_info, nullptr, &commandPool);
     }
 
     void create_descriptor_pool() {
@@ -2268,7 +2288,7 @@ struct ComputeSequence {
         pool_info.maxSets = tasks.size();
         pool_info.poolSizeCount = 1;
         pool_info.pPoolSizes = &pool_size;
-        init->disp.createDescriptorPool(&pool_info, nullptr, &descriptorPool);
+        allocator->init->disp.createDescriptorPool(&pool_info, nullptr, &descriptorPool);
     }
 
     void initializeCompute() {
@@ -2295,8 +2315,8 @@ struct ComputeSequence {
         ds_allocate_info.descriptorPool = descriptorPool;
         ds_allocate_info.descriptorSetCount = tasks.size();
         ds_allocate_info.pSetLayouts = desc_set_layouts.data();
-        init->disp.allocateDescriptorSets(&ds_allocate_info, desc_sets.data());
-
+        allocator->init->disp.allocateDescriptorSets(&ds_allocate_info, desc_sets.data());
+        
         // update the descriptors
         i = 0;
         for (auto& task : tasks) {
@@ -2305,14 +2325,6 @@ struct ComputeSequence {
             task.create_pipeline();
             i++;
         }
-    }
-
-    void initMemory(uint32_t totalNumInputss) {
-        get_queues();
-        create_command_pool();
-        //allBuffers = MemPool<T>(init, totalNumInputss);
-        allBuffers.computeQueue = queue;
-        allBuffers.commandPool = commandPool;
     }
 
     void addBuffers(std::vector<std::vector<T>>& inputs) {
@@ -2338,13 +2350,13 @@ struct ComputeSequence {
         alloc_info.commandPool = commandPool;
         alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         alloc_info.commandBufferCount = static_cast<uint32_t>(tasks.size());
-        init->disp.allocateCommandBuffers(&alloc_info, command_buffers.data());
+        allocator->init->disp.allocateCommandBuffers(&alloc_info, command_buffers.data());
 
         // Create semaphores
         VkSemaphoreCreateInfo semaphore_info = {};
         semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         for (size_t i = 0; i < tasks.size(); i++) {
-            init->disp.createSemaphore(&semaphore_info, nullptr, &semaphores[i]);
+            allocator->init->disp.createSemaphore(&semaphore_info, nullptr, &semaphores[i]);
         }
 
         // Record commands
@@ -2353,9 +2365,9 @@ struct ComputeSequence {
             begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-            init->disp.beginCommandBuffer(command_buffers[i], &begin_info);
+            allocator->init->disp.beginCommandBuffer(command_buffers[i], &begin_info);
             tasks[i].compute(command_buffers[i], workgroup_x, workgroup_y, workgroup_z);
-            init->disp.endCommandBuffer(command_buffers[i]);
+            allocator->init->disp.endCommandBuffer(command_buffers[i]);
         }
 
         // Submit tasks with semaphore chaining
@@ -2382,21 +2394,149 @@ struct ComputeSequence {
                 submit_info.signalSemaphoreCount = 1;
                 submit_info.pSignalSemaphores = &semaphores[i];
 
-                init->disp.queueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
+                allocator->init->disp.queueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
             }
         }
 
         // Wait for the last task to finish
-        init->disp.queueWaitIdle(queue);
+        allocator->init->disp.queueWaitIdle(queue);
 
         // Cleanup
         for (size_t i = 0; i < tasks.size(); i++) {
-            init->disp.destroySemaphore(semaphores[i], nullptr);
+            allocator->init->disp.destroySemaphore(semaphores[i], nullptr);
         }
-        init->disp.freeCommandBuffers(commandPool, static_cast<uint32_t>(tasks.size()), command_buffers.data());
+        allocator->init->disp.freeCommandBuffers(commandPool, static_cast<uint32_t>(tasks.size()), command_buffers.data());
     }
 };
 
+// uses buffer references for compute shaders, bypassing vulkan descriptor sets entirely
+template<typename PushConst>
+struct SquentialGpuTaskNoDesc {
+    // Vulkan handles:
+    VkPipelineLayout pipeline_layout;
+    VkPipeline compute_pipeline;
+    Allocator* allocator;
+
+	PushConst push_const; // the push constants that will be used by the compute shader
+
+	std::vector<char> spv_code = std::vector<char>{}; // we'll have shader bytecode in this
+
+	SequentialgpuTaskNoDesc(std::string& spvByteCodeCompShader, Allocator* allocator, PushConst push_const) : push_const(push_const), allocator(allocator), spv_code(spvByteCodeCompShader.begin(), spvByteCodeCompShader.end()) {
+		create_pipeline();
+	};
+
+    void onSignal() {
+        // this is called when the memPool broadcasts a signal
+        std::cout << "Signal Called\n";
+    }
+
+    void create_pipeline() {
+        VkShaderModuleCreateInfo create_info = {};
+        create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        create_info.codeSize = spv_code.size();
+        create_info.pCode = reinterpret_cast<const uint32_t*>(spv_code.data());
+        VkShaderModule shader_module;
+        allocator->init->disp.createShaderModule(&create_info, nullptr, &shader_module);
+        VkPipelineShaderStageCreateInfo shader_stage_info = {};
+        shader_stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shader_stage_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        shader_stage_info.module = shader_module;
+        shader_stage_info.pName = "main";
+        VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+        pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipeline_layout_info.setLayoutCount = 0; // no descriptor sets
+        pipeline_layout_info.pushConstantRangeCount = 1;
+        pipeline_layout_info.pPushConstantRanges = &PushConst::getPushConstantRange();
+        allocator->init->disp.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout);
+        VkComputePipelineCreateInfo pipeline_info = {};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeline_info.stage = shader_stage_info;
+        pipeline_info.layout = pipeline_layout;
+        pipeline_info.basePipelineHandle = VK_NULL_HANDLE;
+        allocator->init->disp.createComputePipelines(VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &compute_pipeline);
+        allocator->init->disp.destroyShaderModule(shader_module, nullptr);
+    }
+
+	void execute(VkCommandBuffer& command_buffer, uint32_t workgroup_x, uint32_t workgroup_y = 1, uint32_t workgroup_z = 1) {
+		// Bind compute pipeline and push constants
+		allocator->init->disp.cmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
+		allocator->init->disp.cmdPushConstants(command_buffer, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConst), &push_const);
+		// Dispatch compute shader
+		allocator->init->disp.cmdDispatch(command_buffer, workgroup_x, workgroup_y, workgroup_z);
+	}
+};
+
+template<typename UniformBuffer, typename PushConst>
+struct ComputeSequenceBufferReference {
+    Allocator* allocator;
+    std::unique_ptr<StandaloneBuffer<UniformBuffer>> uniform; // the buffer that will carry the device addresses of the actual buffers that're used
+
+	std::vector<std::unique_ptr<SquentialGpuTaskNoDesc<PushConst>>> tasks; // the tasks that will be executed sequentially
+
+    VkCommandPool pool;
+    VkQueue queue;
+    // multiple cmd bufs because simulation can occur multiple times per frame
+	std::vector<VkCommandBuffer> commandBuffers; // the command buffers that will be used to execute the tasks
+
+	ComputeSequenceBufferReference(Allocator* allocator) : allocator(allocator), uniform(std::make_unique<StandaloneBuffer<UniformBuffer>>(1, allocator)) {}
+
+    void addTask(const std::string& shaderCode, PushConst& pushConst) {
+		auto task = std::make_unique<SquentialGpuTaskNoDesc<PushConst>>(shaderCode, allocator, pushConst);
+		tasks.push_back(std::move(task));
+    }
+
+    void createCommandBuffers(const uint32_t MAX_FRAMES) {
+        // Get compute queue
+        auto gq = allocator->init->device.get_queue(vkb::QueueType::compute);
+        if (!gq.has_value()) {
+            std::cout << "failed to get queue: " << gq.error().message() << "\n";
+            return;
+        }
+        queue = gq.value();
+        // Create command pool
+        VkCommandPoolCreateInfo pool_info = {};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.queueFamilyIndex = allocator->init->device.get_queue_index(vkb::QueueType::compute).value();
+        allocator->init->disp.createCommandPool(&pool_info, nullptr, &pool);
+        // Allocate command buffers
+        VkCommandBufferAllocateInfo alloc_info = {};
+        alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        alloc_info.commandPool = pool;
+        alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        alloc_info.commandBufferCount = static_cast<uint32_t>(MAX_FRAMES);
+        commandBuffers.resize(MAX_FRAMES);
+        allocator->init->disp.allocateCommandBuffers(&alloc_info, commandBuffers.data());
+    }
+
+    void recordCmds(const uint32_t MAX_FRAMES, uint32_t workgroup_x, uint32_t workgroup_y = 1, uint32_t workgroup_z = 1) {
+		createCommandBuffers(MAX_FRAMES);
+    
+		// Record commands for each task
+		for (size_t i = 0; i < commandBuffers.size(); i++) {
+			VkCommandBufferBeginInfo begin_info = {};
+			begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+			begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+			allocator->init->disp.beginCommandBuffer(commandBuffers[i], &begin_info);
+            for (size_t j = 0; j < tasks.size(); j++) {
+                tasks[j]->execute(commandBuffers[i], workgroup_x, workgroup_y, workgroup_z); // assuming workgroup_x = 1, can be changed
+            }
+			allocator->init->disp.endCommandBuffer(commandBuffers[i]);
+		}
+    }
+
+	void executeTasks(const uint32_t iterations) {
+        for (uint32_t iter = 0; iter < iterations; iter++) {
+            for (uint32_t i = 0; i < commandBuffers.size(); i++) {
+                VkSubmitInfo submit_info = {};
+                submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submit_info.commandBufferCount = 1;
+                submit_info.pCommandBuffers = &commandBuffers[i];
+                allocator->init->disp.queueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
+            }
+            allocator->init->disp.queueWaitIdle(queue);
+        }
+	}
+};
 // Read shader bytecode from a file
 std::vector<char> readShaderBytecode(const std::string& filename) {
     std::ifstream file(filename, std::ios::ate | std::ios::binary);  // Open file at the end in binary mode
